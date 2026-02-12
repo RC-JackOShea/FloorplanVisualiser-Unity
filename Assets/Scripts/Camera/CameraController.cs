@@ -14,7 +14,7 @@ namespace FloorplanVectoriser.CameraSystem
     public class CameraController : MonoBehaviour
     {
         [Header("Transition Settings")]
-        [SerializeField] private float transitionDuration = 1.5f;
+        [SerializeField] private float transitionDuration = 3f;
         [SerializeField] private float orbitElevation = 30f;
         [SerializeField] private float perspectiveFOV = 60f;
 
@@ -90,8 +90,15 @@ namespace FloorplanVectoriser.CameraSystem
 
             Vector3 startPos = transform.position;
             Quaternion startRot = transform.rotation;
+
+            // Calculate a perspective FOV that matches the current orthographic view
             float startOrthoSize = _cam.orthographicSize;
-            bool switchedProjection = false;
+            float distanceToCenter = Vector3.Distance(startPos, center);
+            float startFOV = 2f * Mathf.Atan(startOrthoSize / distanceToCenter) * Mathf.Rad2Deg;
+
+            // Switch to perspective immediately before the lerp begins
+            _cam.orthographic = false;
+            _cam.fieldOfView = startFOV;
 
             float elapsed = 0f;
             while (elapsed < transitionDuration)
@@ -101,18 +108,7 @@ namespace FloorplanVectoriser.CameraSystem
 
                 transform.position = Vector3.Lerp(startPos, endPos, smooth);
                 transform.rotation = Quaternion.Slerp(startRot, endRot, smooth);
-
-                if (!switchedProjection && t > 0.5f)
-                {
-                    _cam.orthographic = false;
-                    _cam.fieldOfView = perspectiveFOV;
-                    switchedProjection = true;
-                }
-                else if (!switchedProjection)
-                {
-                    // Shrink ortho size in first half for zoom effect
-                    _cam.orthographicSize = Mathf.Lerp(startOrthoSize, 0.5f, smooth * 2f);
-                }
+                _cam.fieldOfView = Mathf.Lerp(startFOV, perspectiveFOV, smooth);
 
                 elapsed += Time.deltaTime;
                 yield return null;

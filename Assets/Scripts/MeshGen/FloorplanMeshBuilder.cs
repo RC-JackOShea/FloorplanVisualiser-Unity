@@ -15,15 +15,34 @@ namespace FloorplanVectoriser.MeshGen
         readonly Material _windowMaterial;
         readonly float _worldScale;
         readonly float _extrudeHeight;
+        readonly float _aspectRatio;
+        readonly float _worldWidth;
+        readonly float _worldHeight;
 
         public FloorplanMeshBuilder(Material wallMaterial, Material doorMaterial, Material windowMaterial,
-            float worldScale = 10f, float extrudeHeight = 2f)
+            float worldScale = 10f, float extrudeHeight = 2f, float aspectRatio = 1f)
         {
             _wallMaterial = wallMaterial;
             _doorMaterial = doorMaterial;
             _windowMaterial = windowMaterial;
             _worldScale = worldScale;
             _extrudeHeight = extrudeHeight;
+            _aspectRatio = aspectRatio;
+            
+            // Calculate actual world dimensions based on aspect ratio
+            // This must match the preview plane sizing in ImageCapture.UpdatePreviewPlaneAspectRatio
+            if (aspectRatio >= 1f)
+            {
+                // Landscape: width is constrained by worldScale
+                _worldWidth = worldScale;
+                _worldHeight = worldScale / aspectRatio;
+            }
+            else
+            {
+                // Portrait: height is constrained by worldScale
+                _worldHeight = worldScale;
+                _worldWidth = worldScale * aspectRatio;
+            }
         }
 
         /// <summary>
@@ -70,8 +89,13 @@ namespace FloorplanVectoriser.MeshGen
             bool isWindow = entry.Category == StructureCategory.Window;
 
             // Map normalized [0,1] coords to world XZ plane with Y-flip
+            // Use _worldWidth for X and _worldHeight for Z to match the preview plane aspect ratio
             Vector3[] bottom = new Vector3[4];
             Vector3[] top = new Vector3[4];
+            
+            // Calculate the offset to center the mesh (matching preview plane centering)
+            float offsetX = (_worldScale - _worldWidth) / 2f;
+            float offsetZ = (_worldScale - _worldHeight) / 2f;
             
             // Calculate center for scaling doors/windows
             float centerX = 0f, centerZ = 0f;
@@ -79,8 +103,8 @@ namespace FloorplanVectoriser.MeshGen
             {
                 for (int i = 0; i < 4; i++)
                 {
-                    centerX += entry.Vertices[i].x * _worldScale;
-                    centerZ += (1f - entry.Vertices[i].y) * _worldScale;
+                    centerX += entry.Vertices[i].x * _worldWidth + offsetX;
+                    centerZ += (1f - entry.Vertices[i].y) * _worldHeight + offsetZ;
                 }
                 centerX /= 4f;
                 centerZ /= 4f;
@@ -88,12 +112,12 @@ namespace FloorplanVectoriser.MeshGen
 
             // Determine Y positions based on category
             float bottomY = isWindow ? 1f : 0f;                           // Windows start 1m up
-            float topY = isWindow ? 1.75f : _extrudeHeight;                  // Windows are 1m tall
+            float topY = isWindow ? 1.75f : _extrudeHeight;               // Windows are 1m tall
 
             for (int i = 0; i < 4; i++)
             {
-                float wx = entry.Vertices[i].x * _worldScale;
-                float wz = (1f - entry.Vertices[i].y) * _worldScale; // Y-flip
+                float wx = entry.Vertices[i].x * _worldWidth + offsetX;
+                float wz = (1f - entry.Vertices[i].y) * _worldHeight + offsetZ; // Y-flip
 
                 // Scale doors/windows by 1.1x from center to prevent z-fighting
                 if (isDoorOrWindow)

@@ -1,3 +1,5 @@
+using System;
+using System.Collections;
 using System.Threading.Tasks;
 using FloorplanVectoriser.Capture;
 using FloorplanVectoriser.CameraSystem;
@@ -30,6 +32,9 @@ namespace FloorplanVectoriser.App
         [Header("Mesh Settings")]
         [SerializeField] private float worldScale = 10f;
         [SerializeField] private float extrudeHeight = 2f;
+
+        [Header("Mesh Animation")]
+        [SerializeField] private float meshScaleUpDuration = 0.6f;
 
         [Header("Post-Processing")]
         [SerializeField] private float detectionThreshold = 0.5f;
@@ -75,9 +80,12 @@ namespace FloorplanVectoriser.App
             {
                 case AppState.CameraPreview:
                     SetActive(captureUI, true);
-                    imageCapture.StartPreview();
                     cameraController.SetupOrthographic(worldScale / 2f);
                     cameraController.StopOrbit();
+                    // Set up the 3D preview plane centered in camera view BEFORE starting preview
+                    // so the texture can be applied to the plane material
+                    imageCapture.SetupPreviewPlane(worldScale);
+                    imageCapture.StartPreview();
                     // Clean up any previous meshes
                     if (_generatedMeshRoot != null)
                     {
@@ -98,6 +106,7 @@ namespace FloorplanVectoriser.App
 
                 case AppState.CameraTransition:
                     // No UI shown during transition
+                    // Preview plane remains visible under the generated mesh
                     break;
 
                 case AppState.Viewing:
@@ -181,20 +190,47 @@ namespace FloorplanVectoriser.App
                       $"{CountByCategory(result, StructureCategory.Window)} windows");
 
             // Build 3D meshes (must be on main thread)
+            // Pass the image aspect ratio so meshes align with the preview plane
+            float aspectRatio = imageCapture.GetCurrentAspectRatio();
             var meshBuilder = new FloorplanMeshBuilder(
-                wallMaterial, doorMaterial, windowMaterial, worldScale, extrudeHeight);
+                wallMaterial, doorMaterial, windowMaterial, worldScale, extrudeHeight, aspectRatio);
             var (root, bounds) = meshBuilder.BuildFromResult(result);
             _generatedMeshRoot = root;
+
+            // Start mesh with Y scale at zero for expand animation
+            _generatedMeshRoot.transform.localScale = new Vector3(1f, 0f, 1f);
 
             // Transition camera to perspective orbit
             TransitionTo(AppState.CameraTransition);
             cameraController.LerpToPerspective(bounds.center, bounds, () =>
             {
-                TransitionTo(AppState.Viewing);
+                // Animate mesh scaling up from ground after camera arrives
+                StartCoroutine(AnimateMeshScaleUp(() => TransitionTo(AppState.Viewing)));
             });
         }
 
         // --- Helpers ---
+
+        IEnumerator AnimateMeshScaleUp(Action onComplete)
+        {
+            if (_generatedMeshRoot == null)
+            {
+                onComplete?.Invoke();
+                yield break;
+            }
+
+            float elapsed = 0f;
+            while (elapsed < meshScaleUpDuration)
+            {
+                float t = Mathf.SmoothStep(0f, 1f, elapsed / meshScaleUpDuration);
+                _generatedMeshRoot.transform.localScale = new Vector3(1f, t, 1f);
+                elapsed += Time.deltaTime;
+                yield return null;
+            }
+
+            _generatedMeshRoot.transform.localScale = Vector3.one;
+            onComplete?.Invoke();
+        }
 
         static void SetActive(GameObject obj, bool active)
         {
