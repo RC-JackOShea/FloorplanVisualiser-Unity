@@ -57,6 +57,10 @@ namespace FloorplanVectoriser.App
         [Header("UI - Processing")]
         [SerializeField] private GameObject processingUI;
 
+        [Header("UI - Viewing")]
+        [SerializeField] private GameObject viewingUI;
+        [SerializeField] private Button resetButton;
+
         AppState _currentState;
         GameObject _generatedMeshRoot;
 
@@ -69,6 +73,7 @@ namespace FloorplanVectoriser.App
             if (galleryButton != null) galleryButton.onClick.AddListener(OnGalleryPressed);
             if (approveButton != null) approveButton.onClick.AddListener(OnApprovePressed);
             if (retakeButton != null) retakeButton.onClick.AddListener(OnRetakePressed);
+            if (resetButton != null) resetButton.onClick.AddListener(OnResetPressed);
 
             TransitionTo(AppState.CameraPreview);
         }
@@ -82,6 +87,7 @@ namespace FloorplanVectoriser.App
             SetActive(captureUI, false);
             SetActive(reviewUI, false);
             SetActive(processingUI, false);
+            SetActive(viewingUI, false);
 
             switch (newState)
             {
@@ -118,6 +124,7 @@ namespace FloorplanVectoriser.App
 
                 case AppState.Viewing:
                     // Orbit is enabled by CameraController after transition
+                    SetActive(viewingUI, true);
                     break;
             }
         }
@@ -155,6 +162,14 @@ namespace FloorplanVectoriser.App
         void OnRetakePressed()
         {
             if (_currentState != AppState.ImageReview) return;
+            TransitionTo(AppState.CameraPreview);
+        }
+
+        void OnResetPressed()
+        {
+            if (_currentState != AppState.Viewing) return;
+            // Stop orbit and go back to camera preview to start fresh
+            cameraController.StopOrbit();
             TransitionTo(AppState.CameraPreview);
         }
 
