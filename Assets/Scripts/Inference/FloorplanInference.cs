@@ -17,11 +17,16 @@ namespace FloorplanVectoriser.Inference
 
         [SerializeField] private int inputSize = 512;
         
-        [Tooltip("Use CPU backend for larger models (1024+) to avoid GPU thread group limits")]
+        [Tooltip("Use CPU backend to avoid GPU contention (recommended for mobile)")]
         [SerializeField] private bool forceCPU = false;
+        
+        [Tooltip("Layers to execute per frame when using iterative scheduling (lower = less GPU pressure)")]
+        [SerializeField] private int layersPerFrame = 20;
 
         /// <summary>True while inference is running.</summary>
         public bool IsRunning { get; private set; }
+        
+        private bool _useCPU;
 
         void Awake()
         {
@@ -32,26 +37,32 @@ namespace FloorplanVectoriser.Inference
             }
             _model = ModelLoader.Load(modelAsset);
             
-            // For larger models (1024+), GPU compute can hit thread group limits
-            // Use CPU backend in those cases, or when explicitly requested
-            bool useCPU = forceCPU || inputSize > 512;
+            // Force CPU on Android to avoid GPU timeout (QUEUE_BUFFER_TIMEOUT)
+            // Mobile GPUs can't handle heavy ML inference without blocking the rendering pipeline
+            bool isMobile = Application.platform == RuntimePlatform.Android || 
+                           Application.platform == RuntimePlatform.IPhonePlayer;
             
-            if (useCPU)
+            // Use CPU for: mobile devices, large models (1024+), or when explicitly requested
+            _useCPU = forceCPU || isMobile || inputSize > 512;
+            
+            if (_useCPU)
             {
-                Debug.Log($"Using CPU backend for inference (inputSize: {inputSize})");
+                Debug.Log($"Using CPU backend for inference (inputSize: {inputSize}, mobile: {isMobile})");
                 _worker = new Worker(_model, BackendType.CPU);
             }
             else
             {
-                // Prefer GPU for 512 and smaller; fall back to CPU if unavailable
+                // Prefer GPU for desktop with smaller models; fall back to CPU if unavailable
                 try
                 {
                     _worker = new Worker(_model, BackendType.GPUCompute);
+                    Debug.Log("Using GPU backend for inference");
                 }
                 catch
                 {
                     Debug.LogWarning("GPU compute not available, falling back to CPU.");
                     _worker = new Worker(_model, BackendType.CPU);
+                    _useCPU = true;
                 }
             }
         }
@@ -96,25 +107,45 @@ namespace FloorplanVectoriser.Inference
                 }
             }
 
-            // 2. Run inference
-            _worker.Schedule(inputTensor);
+            // 2. Run inference using iterative scheduling to spread work across frames
+            // This prevents blocking the main thread and avoids GPU timeout on mobile
+            var enumerator = _worker.ScheduleIterable(inputTensor);
+            int layersThisFrame = 0;
+            int totalLayers = 0;
             
-            // Allow time for inference to complete
-            // CPU backend needs more time for larger models
-            if (inputSize > 512)
+            while (enumerator.MoveNext())
             {
-                // For larger models on CPU, yield multiple frames
-                for (int i = 0; i < 10; i++)
-                    yield return null;
+                totalLayers++;
+                layersThisFrame++;
+                if (layersThisFrame >= layersPerFrame)
+                {
+                    layersThisFrame = 0;
+                    yield return null; // Yield to let rendering happen
+                }
             }
-            else
-            {
-                yield return null; // Single frame for GPU work
-            }
+            
+            Debug.Log($"Inference complete: executed {totalLayers} layers");
+            
+            // Ensure we yield at least once after scheduling completes
+            yield return null;
 
             // 3. Read output
             var outputTensor = _worker.PeekOutput() as Tensor<float>;
-            float[] outputData = outputTensor.DownloadToArray();
+            float[] outputData;
+            
+            if (_useCPU)
+            {
+                // CPU backend: data is already on CPU, direct download is fast
+                outputData = outputTensor.DownloadToArray();
+            }
+            else
+            {
+                // GPU backend: use async readback to avoid blocking
+                outputTensor.ReadbackRequest();
+                while (!outputTensor.IsReadbackRequestDone())
+                    yield return null;
+                outputData = outputTensor.DownloadToArray();
+            }
 
             inputTensor.Dispose();
 

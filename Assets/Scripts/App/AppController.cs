@@ -32,12 +32,17 @@ namespace FloorplanVectoriser.App
         [Header("Mesh Settings")]
         [SerializeField] private float worldScale = 10f;
         [SerializeField] private float extrudeHeight = 2f;
+        [Tooltip("Number of meshes to create per frame during generation (lower = less GPU pressure on mobile)")]
+        [SerializeField] private int meshesPerFrame = 4;
 
         [Header("Mesh Animation")]
         [SerializeField] private float meshScaleUpDuration = 0.6f;
 
         [Header("Post-Processing")]
+        [Tooltip("Confidence threshold for wall/door/window detection (lower = more detections, may include false positives)")]
         [SerializeField] private float detectionThreshold = 0.5f;
+        [Tooltip("Use lower threshold on mobile due to CPU inference differences")]
+        [SerializeField] private float mobileThresholdMultiplier = 0.7f;
 
         [Header("UI - Capture")]
         [SerializeField] private GameObject captureUI;
@@ -57,6 +62,8 @@ namespace FloorplanVectoriser.App
 
         void Start()
         {
+            Application.targetFrameRate = 120;
+            
             // Wire up buttons
             if (captureButton != null) captureButton.onClick.AddListener(OnCapturePressed);
             if (galleryButton != null) galleryButton.onClick.AddListener(OnGalleryPressed);
@@ -169,8 +176,14 @@ namespace FloorplanVectoriser.App
 
         async void OnInferenceComplete(float[,,] heatmaps, float[,,] rooms, float[,,] icons)
         {
+            // Apply lower threshold on mobile (CPU inference can produce slightly different confidence values)
+            bool isMobile = Application.platform == RuntimePlatform.Android || 
+                           Application.platform == RuntimePlatform.IPhonePlayer;
+            float threshold = isMobile ? detectionThreshold * mobileThresholdMultiplier : detectionThreshold;
+            Debug.Log($"Using detection threshold: {threshold} (mobile: {isMobile})");
+            
             // Post-processing is CPU-bound; run off the main thread
-            var postProcessor = new PostProcessor(detectionThreshold);
+            var postProcessor = new PostProcessor(threshold);
             PolygonResult result = null;
 
             await Task.Run(() =>
@@ -189,24 +202,27 @@ namespace FloorplanVectoriser.App
                       $"{CountByCategory(result, StructureCategory.Door)} doors, " +
                       $"{CountByCategory(result, StructureCategory.Window)} windows");
 
-            // Build 3D meshes (must be on main thread)
+            // Build 3D meshes asynchronously (spread across frames to avoid GPU timeout on mobile)
             // Pass the image aspect ratio so meshes align with the preview plane
             float aspectRatio = imageCapture.GetCurrentAspectRatio();
             var meshBuilder = new FloorplanMeshBuilder(
                 wallMaterial, doorMaterial, windowMaterial, worldScale, extrudeHeight, aspectRatio);
-            var (root, bounds) = meshBuilder.BuildFromResult(result);
-            _generatedMeshRoot = root;
-
-            // Start mesh with Y scale at zero for expand animation
-            _generatedMeshRoot.transform.localScale = new Vector3(1f, 0f, 1f);
-
-            // Transition camera to perspective orbit
-            TransitionTo(AppState.CameraTransition);
-            cameraController.LerpToPerspective(bounds.center, bounds, () =>
+            
+            StartCoroutine(meshBuilder.BuildFromResultAsync(result, meshesPerFrame, (root, bounds) =>
             {
-                // Animate mesh scaling up from ground after camera arrives
-                StartCoroutine(AnimateMeshScaleUp(() => TransitionTo(AppState.Viewing)));
-            });
+                _generatedMeshRoot = root;
+
+                // Start mesh with Y scale at zero for expand animation
+                _generatedMeshRoot.transform.localScale = new Vector3(1f, 0f, 1f);
+
+                // Transition camera to perspective orbit
+                TransitionTo(AppState.CameraTransition);
+                cameraController.LerpToPerspective(bounds.center, bounds, () =>
+                {
+                    // Animate mesh scaling up from ground after camera arrives
+                    StartCoroutine(AnimateMeshScaleUp(() => TransitionTo(AppState.Viewing)));
+                });
+            }));
         }
 
         // --- Helpers ---

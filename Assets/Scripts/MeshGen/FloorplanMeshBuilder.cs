@@ -1,3 +1,5 @@
+using System;
+using System.Collections;
 using System.Collections.Generic;
 using FloorplanVectoriser.Data;
 using UnityEngine;
@@ -76,6 +78,51 @@ namespace FloorplanVectoriser.MeshGen
             }
 
             return (root, allBounds);
+        }
+
+        /// <summary>
+        /// Async version of BuildFromResult that spreads mesh creation across multiple frames
+        /// to avoid GPU timeout on mobile devices.
+        /// </summary>
+        /// <param name="result">The polygon detection result.</param>
+        /// <param name="meshesPerFrame">Number of meshes to create per frame before yielding.</param>
+        /// <param name="onComplete">Callback with the root GameObject and combined bounds.</param>
+        public IEnumerator BuildFromResultAsync(PolygonResult result, int meshesPerFrame, Action<GameObject, Bounds> onComplete)
+        {
+            var root = new GameObject("Floorplan");
+            var allBounds = new Bounds();
+            bool boundsInitialized = false;
+
+            int meshesThisFrame = 0;
+
+            for (int i = 0; i < result.Polygons.Count; i++)
+            {
+                var entry = result.Polygons[i];
+                var obj = CreateExtrudedBox(entry, i, root.transform);
+
+                var renderer = obj.GetComponent<MeshRenderer>();
+                if (renderer != null)
+                {
+                    if (!boundsInitialized)
+                    {
+                        allBounds = renderer.bounds;
+                        boundsInitialized = true;
+                    }
+                    else
+                    {
+                        allBounds.Encapsulate(renderer.bounds);
+                    }
+                }
+
+                meshesThisFrame++;
+                if (meshesThisFrame >= meshesPerFrame)
+                {
+                    meshesThisFrame = 0;
+                    yield return null; // Wait for next frame
+                }
+            }
+
+            onComplete?.Invoke(root, allBounds);
         }
 
         GameObject CreateExtrudedBox(PolygonEntry entry, int index, Transform parent)

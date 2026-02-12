@@ -198,9 +198,11 @@ namespace FloorplanVectoriser.Capture
             if (debugFloorPlanTexture != null)
             {
                 Debug.Log("ImageCapture: Using debug floorplan texture for preview");
-                // Store the debug texture aspect ratio
-                _currentImageAspectRatio = (float)debugFloorPlanTexture.width / debugFloorPlanTexture.height;
+                // Preview will be square (center crop)
+                _currentImageAspectRatio = 1f;
                 UpdatePreviewPlaneTexture(debugFloorPlanTexture);
+                // Apply UV crop to show center square of debug texture
+                ApplySquareCropUV(debugFloorPlanTexture.width, debugFloorPlanTexture.height);
                 if (_currentWorldScale > 0)
                 {
                     UpdatePreviewPlaneAspectRatio();
@@ -269,10 +271,13 @@ namespace FloorplanVectoriser.Capture
             {
                 Debug.Log($"ImageCapture: Camera resolution detected: {_webCamTexture.width}x{_webCamTexture.height}");
                 
-                // Store the camera aspect ratio
-                _currentImageAspectRatio = (float)_webCamTexture.width / _webCamTexture.height;
+                // Preview will show the center-cropped square, so aspect ratio is 1:1
+                _currentImageAspectRatio = 1f;
                 
-                // Update preview plane aspect ratio if we have a world scale set
+                // Apply UV cropping to show only the center square portion of the webcam feed
+                ApplySquareCropUV(_webCamTexture.width, _webCamTexture.height);
+                
+                // Update preview plane to be square
                 if (_currentWorldScale > 0)
                 {
                     UpdatePreviewPlaneAspectRatio();
@@ -297,14 +302,18 @@ namespace FloorplanVectoriser.Capture
         }
 
         /// <summary>
-        /// Capture the current camera frame as a Texture2D, resized to targetSize x targetSize.
+        /// Capture the current camera frame as a Texture2D, cropped to square and resized to targetSize x targetSize.
         /// </summary>
         public Texture2D Capture()
         {
             if (debugFloorPlanTexture != null)
             {
-                _capturedImage = debugFloorPlanTexture;
+                // Crop debug texture to square just like camera capture
+                _capturedImage = CropToSquareAndResize(debugFloorPlanTexture, targetSize);
+                _currentImageAspectRatio = 1f;
+                ResetUV();
                 UpdatePreviewPlaneTexture(_capturedImage);
+                UpdatePreviewPlaneAspectRatio();
                 return _capturedImage;
             }
 
@@ -319,14 +328,21 @@ namespace FloorplanVectoriser.Capture
             tempTex.SetPixels(_webCamTexture.GetPixels());
             tempTex.Apply();
 
-            // Resize to target dimensions
-            _capturedImage = ResizeTexture(tempTex, targetSize, targetSize);
+            // Center-crop to square using the smaller dimension, then resize
+            _capturedImage = CropToSquareAndResize(tempTex, targetSize);
             Destroy(tempTex);
+
+            // Update aspect ratio to 1:1 since we're now using a square crop
+            _currentImageAspectRatio = 1f;
+
+            // Reset UV since the captured texture is already cropped to square
+            ResetUV();
 
             // Show the frozen capture in the preview
             if (previewImage != null)
                 previewImage.texture = _capturedImage;
             UpdatePreviewPlaneTexture(_capturedImage);
+            UpdatePreviewPlaneAspectRatio();
 
             StopPreview();
             return _capturedImage;
@@ -334,7 +350,7 @@ namespace FloorplanVectoriser.Capture
 
         /// <summary>
         /// Load an image from a file path (for gallery picker or testing).
-        /// The preview plane will be adjusted to match the original image aspect ratio.
+        /// The image is center-cropped to square to match camera capture behavior.
         /// </summary>
         public Texture2D LoadFromFile(string path)
         {
@@ -347,18 +363,23 @@ namespace FloorplanVectoriser.Capture
                 return null;
             }
 
-            // Store the original aspect ratio before resizing
-            _currentImageAspectRatio = (float)tex.width / tex.height;
-            Debug.Log($"ImageCapture: Loaded image {tex.width}x{tex.height} (aspect ratio: {_currentImageAspectRatio:F2})");
+            Debug.Log($"ImageCapture: Loaded image {tex.width}x{tex.height}, will center-crop to square");
 
-            _capturedImage = ResizeTexture(tex, targetSize, targetSize);
+            // Center-crop to square and resize (same as camera capture)
+            _capturedImage = CropToSquareAndResize(tex, targetSize);
             Destroy(tex);
+
+            // Aspect ratio is now 1:1 since we cropped to square
+            _currentImageAspectRatio = 1f;
+
+            // Reset UV since the texture is already cropped to square
+            ResetUV();
 
             if (previewImage != null)
                 previewImage.texture = _capturedImage;
             UpdatePreviewPlaneTexture(_capturedImage);
 
-            // Update the preview plane to match the original image aspect ratio
+            // Update the preview plane to square
             if (_currentWorldScale > 0)
             {
                 UpdatePreviewPlaneAspectRatio();
@@ -517,6 +538,63 @@ namespace FloorplanVectoriser.Capture
         }
 
         /// <summary>
+        /// Apply UV tiling/offset to show only the center square crop of a non-square texture.
+        /// This makes the live preview show exactly what will be captured.
+        /// </summary>
+        void ApplySquareCropUV(int textureWidth, int textureHeight)
+        {
+            if (_previewPlaneMaterialInstance == null) return;
+
+            float aspectRatio = (float)textureWidth / textureHeight;
+            Vector2 tiling;
+            Vector2 offset;
+
+            if (aspectRatio >= 1f)
+            {
+                // Landscape: crop sides (width > height)
+                float cropRatio = (float)textureHeight / textureWidth;
+                tiling = new Vector2(cropRatio, 1f);
+                offset = new Vector2((1f - cropRatio) / 2f, 0f);
+            }
+            else
+            {
+                // Portrait: crop top/bottom (height > width)
+                float cropRatio = (float)textureWidth / textureHeight;
+                tiling = new Vector2(1f, cropRatio);
+                offset = new Vector2(0f, (1f - cropRatio) / 2f);
+            }
+
+            // Apply to material (works for both Built-in RP and URP)
+            _previewPlaneMaterialInstance.mainTextureScale = tiling;
+            _previewPlaneMaterialInstance.mainTextureOffset = offset;
+            
+            if (_previewPlaneMaterialInstance.HasProperty("_BaseMap"))
+            {
+                _previewPlaneMaterialInstance.SetTextureScale("_BaseMap", tiling);
+                _previewPlaneMaterialInstance.SetTextureOffset("_BaseMap", offset);
+            }
+
+            Debug.Log($"ImageCapture: Applied square crop UV - tiling: {tiling}, offset: {offset} (aspect: {aspectRatio:F2})");
+        }
+
+        /// <summary>
+        /// Reset UV tiling/offset to show the full texture (used after capture when texture is already square).
+        /// </summary>
+        void ResetUV()
+        {
+            if (_previewPlaneMaterialInstance == null) return;
+
+            _previewPlaneMaterialInstance.mainTextureScale = Vector2.one;
+            _previewPlaneMaterialInstance.mainTextureOffset = Vector2.zero;
+            
+            if (_previewPlaneMaterialInstance.HasProperty("_BaseMap"))
+            {
+                _previewPlaneMaterialInstance.SetTextureScale("_BaseMap", Vector2.one);
+                _previewPlaneMaterialInstance.SetTextureOffset("_BaseMap", Vector2.zero);
+            }
+        }
+
+        /// <summary>
         /// Open a file picker to select an image. Works on Windows, Android, and in the Editor.
         /// </summary>
         public void OpenGallery(System.Action<Texture2D> onImageSelected)
@@ -641,6 +719,46 @@ namespace FloorplanVectoriser.Capture
 
             var result = new Texture2D(newWidth, newHeight, TextureFormat.RGB24, false);
             result.ReadPixels(new Rect(0, 0, newWidth, newHeight), 0, 0);
+            result.Apply();
+
+            RenderTexture.active = prev;
+            RenderTexture.ReleaseTemporary(rt);
+            return result;
+        }
+
+        /// <summary>
+        /// Center-crop the source texture to a square (using the smaller dimension), then resize to targetSize.
+        /// This avoids distortion by cropping rather than squishing.
+        /// </summary>
+        static Texture2D CropToSquareAndResize(Texture2D source, int targetSize)
+        {
+            int srcWidth = source.width;
+            int srcHeight = source.height;
+            int cropSize = Mathf.Min(srcWidth, srcHeight);
+            
+            // Calculate center crop offset
+            int offsetX = (srcWidth - cropSize) / 2;
+            int offsetY = (srcHeight - cropSize) / 2;
+
+            Debug.Log($"ImageCapture: Cropping {srcWidth}x{srcHeight} to {cropSize}x{cropSize} square (offset: {offsetX}, {offsetY}), then resizing to {targetSize}x{targetSize}");
+
+            // Use GPU blit with source rect to crop and resize in one pass
+            RenderTexture rt = RenderTexture.GetTemporary(targetSize, targetSize, 0, RenderTextureFormat.ARGB32);
+            
+            // Calculate UV rect for the center crop
+            float uvX = (float)offsetX / srcWidth;
+            float uvY = (float)offsetY / srcHeight;
+            float uvWidth = (float)cropSize / srcWidth;
+            float uvHeight = (float)cropSize / srcHeight;
+
+            // Blit with source rect to crop and scale
+            Graphics.Blit(source, rt, new Vector2(uvWidth, uvHeight), new Vector2(uvX, uvY));
+
+            RenderTexture prev = RenderTexture.active;
+            RenderTexture.active = rt;
+
+            var result = new Texture2D(targetSize, targetSize, TextureFormat.RGB24, false);
+            result.ReadPixels(new Rect(0, 0, targetSize, targetSize), 0, 0);
             result.Apply();
 
             RenderTexture.active = prev;

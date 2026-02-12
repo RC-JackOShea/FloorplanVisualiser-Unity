@@ -368,6 +368,7 @@ MonoBehaviour:
   modelAsset: {fileID: 5022602860645237092, guid: bce37223b9a4c0d4ba3f165e1fc80f1a, type: 3}
   inputSize: 512
   forceCPU: 0
+  layersPerFrame: 20
 --- !u!114 &313707188
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -388,8 +389,10 @@ MonoBehaviour:
   windowMaterial: {fileID: 2100000, guid: f4c21b651cd0d0d44bd500d4b14b369b, type: 2}
   worldScale: 10
   extrudeHeight: 2
+  meshesPerFrame: 4
   meshScaleUpDuration: 0.6
   detectionThreshold: 0.5
+  mobileThresholdMultiplier: 0.5
   captureUI: {fileID: 761323275}
   captureButton: {fileID: 858247827}
   galleryButton: {fileID: 1385242282}
