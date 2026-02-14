@@ -1,10 +1,12 @@
 using System;
 using System.Collections;
+using System.IO;
 using System.Threading.Tasks;
 using FloorplanVectoriser.Capture;
 using FloorplanVectoriser.CameraSystem;
 using FloorplanVectoriser.Data;
 using FloorplanVectoriser.Inference;
+using FloorplanVectoriser.Conversion;
 using FloorplanVectoriser.MeshGen;
 using FloorplanVectoriser.PostProcessing;
 using UnityEngine;
@@ -44,6 +46,10 @@ namespace FloorplanVectoriser.App
         [Tooltip("Use lower threshold on mobile due to CPU inference differences")]
         [SerializeField] private float mobileThresholdMultiplier = 0.7f;
 
+        [Header("Sketch Export")]
+        [Tooltip("Photo capture size in metres — maps normalized [0,1] coordinates to world scale")]
+        [SerializeField] private Vector2 photoCaptureSize = new Vector2(7f, 7f);
+
         [Header("UI - Capture")]
         [SerializeField] private GameObject captureUI;
         [SerializeField] private Button captureButton;
@@ -60,9 +66,12 @@ namespace FloorplanVectoriser.App
         [Header("UI - Viewing")]
         [SerializeField] private GameObject viewingUI;
         [SerializeField] private Button resetButton;
+        [SerializeField] private Button saveButton;
 
         AppState _currentState;
         GameObject _generatedMeshRoot;
+        SketchFile _lastSketch;
+        string _lastSketchJson;
 
         void Start()
         {
@@ -74,6 +83,7 @@ namespace FloorplanVectoriser.App
             if (approveButton != null) approveButton.onClick.AddListener(OnApprovePressed);
             if (retakeButton != null) retakeButton.onClick.AddListener(OnRetakePressed);
             if (resetButton != null) resetButton.onClick.AddListener(OnResetPressed);
+            if (saveButton != null) saveButton.onClick.AddListener(OnSavePressed);
 
             TransitionTo(AppState.CameraPreview);
         }
@@ -99,7 +109,9 @@ namespace FloorplanVectoriser.App
                     // so the texture can be applied to the plane material
                     imageCapture.SetupPreviewPlane(worldScale);
                     imageCapture.StartPreview();
-                    // Clean up any previous meshes
+                    // Clean up previous state
+                    _lastSketch = null;
+                    _lastSketchJson = null;
                     if (_generatedMeshRoot != null)
                     {
                         Destroy(_generatedMeshRoot);
@@ -173,6 +185,19 @@ namespace FloorplanVectoriser.App
             TransitionTo(AppState.CameraPreview);
         }
 
+        void OnSavePressed()
+        {
+            if (_currentState != AppState.Viewing || _lastSketch == null) return;
+
+            string sketchesDir = Path.Combine(Application.persistentDataPath, "Sketches");
+            Directory.CreateDirectory(sketchesDir);
+
+            string fileName = $"{_lastSketch.displayName}_{_lastSketch.guid}.sketch";
+            string path = Path.Combine(sketchesDir, fileName);
+            SketchSerializer.WriteSketchFile(path, _lastSketch);
+            Debug.Log($"Sketch saved to: {path}");
+        }
+
         // --- Pipeline ---
 
         void RunPipeline()
@@ -216,6 +241,11 @@ namespace FloorplanVectoriser.App
             Debug.Log($"Detected: {CountByCategory(result, StructureCategory.Wall)} walls, " +
                       $"{CountByCategory(result, StructureCategory.Door)} doors, " +
                       $"{CountByCategory(result, StructureCategory.Window)} windows");
+
+            // Convert to sketch format and cache for save button
+            _lastSketch = SketchConverter.Convert(result, photoCaptureSize);
+            _lastSketchJson = SketchSerializer.SerializeJson(_lastSketch);
+            Debug.Log($"Sketch JSON ({_lastSketch.entities.Count} entities):\n{_lastSketchJson}");
 
             // Build 3D meshes asynchronously (spread across frames to avoid GPU timeout on mobile)
             // Pass the image aspect ratio so meshes align with the preview plane
