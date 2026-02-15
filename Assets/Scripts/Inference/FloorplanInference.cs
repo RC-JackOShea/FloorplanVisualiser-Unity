@@ -15,7 +15,7 @@ namespace FloorplanVectoriser.Inference
         private Model _model;
         private Worker _worker;
 
-        [SerializeField] private int inputSize = 512;
+        [SerializeField] private int inputSize = 1024;
         
         [Tooltip("Use CPU backend to avoid GPU contention (recommended for mobile)")]
         [SerializeField] private bool forceCPU = false;

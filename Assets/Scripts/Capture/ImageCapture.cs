@@ -17,7 +17,7 @@ namespace FloorplanVectoriser.Capture
     public class ImageCapture : MonoBehaviour
     {
         [SerializeField] private RawImage previewImage;
-        [SerializeField] private int targetSize = 512;
+        [SerializeField] private int targetSize = 1024;
 
         [Header("Camera Selection")]
         [SerializeField] private Button cameraSwitchButton;
@@ -189,10 +189,23 @@ namespace FloorplanVectoriser.Capture
             return _currentImageAspectRatio;
         }
 
+        /// <summary>Clear the captured image so the preview plane won't hold a stale texture.</summary>
+        public void ClearCapturedImage()
+        {
+            if (_capturedImage != null)
+            {
+                Destroy(_capturedImage);
+                _capturedImage = null;
+            }
+        }
+
         /// <summary>Start the camera feed and display on the preview RawImage.</summary>
         public void StartPreview()
         {
             if (_isPreviewing) return;
+
+            // Release any previous capture so the preview plane doesn't show a stale frame
+            ClearCapturedImage();
 
             // If using debug texture, apply it to the preview plane immediately
             if (debugFloorPlanTexture != null)
@@ -236,9 +249,25 @@ namespace FloorplanVectoriser.Capture
                 }
             }
 
-            _webCamTexture = deviceName != null
-                ? new WebCamTexture(deviceName, 1280, 720)
-                : new WebCamTexture(1280, 720);
+            // Reuse existing webcam texture if it matches the selected device,
+            // otherwise destroy and create a new one. Reusing avoids Android issues
+            // where the camera hardware hasn't fully released yet.
+            if (_webCamTexture != null && _webCamTexture.deviceName == deviceName)
+            {
+                Debug.Log($"ImageCapture: Reusing existing webcam texture '{_webCamTexture.deviceName}'");
+            }
+            else
+            {
+                if (_webCamTexture != null)
+                {
+                    _webCamTexture.Stop();
+                    Destroy(_webCamTexture);
+                }
+
+                _webCamTexture = deviceName != null
+                    ? new WebCamTexture(deviceName, 1920, 1080)
+                    : new WebCamTexture(1920, 1080);
+            }
 
             Debug.Log($"ImageCapture: Starting webcam '{_webCamTexture.deviceName}'");
             _webCamTexture.Play();
@@ -475,6 +504,9 @@ namespace FloorplanVectoriser.Capture
         /// <summary>
         /// Hide the 3D preview plane (e.g., when transitioning to mesh viewing).
         /// </summary>
+        /// <summary>Returns the preview plane GameObject (for material access).</summary>
+        public GameObject GetPreviewPlane() => _previewPlane;
+
         public void HidePreviewPlane()
         {
             if (_previewPlane != null)
@@ -504,9 +536,19 @@ namespace FloorplanVectoriser.Capture
             if (collider != null)
                 Destroy(collider);
 
-            // Set up material
+            // Set up material with UnlitFade shader for opacity control
             var renderer = _previewPlane.GetComponent<MeshRenderer>();
-            if (previewPlaneMaterial != null)
+            var unlitFadeShader = Shader.Find("Custom/UnlitFade");
+            if (unlitFadeShader != null)
+            {
+                _previewPlaneMaterialInstance = new Material(unlitFadeShader);
+                _previewPlaneMaterialInstance.SetFloat("_Opacity", 1f);
+                _previewPlaneMaterialInstance.SetFloat("_BorderWidth", 0.01f);
+                _previewPlaneMaterialInstance.SetColor("_BorderColor", new Color(0f, 1f, 1f, 1f));
+                renderer.material = _previewPlaneMaterialInstance;
+                Debug.Log("ImageCapture: Using Custom/UnlitFade shader for preview plane");
+            }
+            else if (previewPlaneMaterial != null)
             {
                 _previewPlaneMaterialInstance = new Material(previewPlaneMaterial);
                 renderer.material = _previewPlaneMaterialInstance;
@@ -514,8 +556,6 @@ namespace FloorplanVectoriser.Capture
             }
             else
             {
-                // Use the default material from the primitive and modify it
-                // This ensures compatibility with whatever render pipeline is active
                 _previewPlaneMaterialInstance = renderer.material;
                 Debug.Log($"ImageCapture: Using default primitive material with shader: {_previewPlaneMaterialInstance.shader.name}");
             }

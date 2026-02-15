@@ -51,7 +51,7 @@ namespace FloorplanVectoriser.CameraSystem
         public void SetupOrthographic(float orthoSize)
         {
             _cam.orthographic = true;
-            _cam.orthographicSize = orthoSize;
+            _cam.orthographicSize = orthoSize * 1.1f; // slight margin to show edges
             _cam.nearClipPlane = 0.1f;
             _cam.farClipPlane = 100f;
 
@@ -68,15 +68,15 @@ namespace FloorplanVectoriser.CameraSystem
         /// <param name="targetCenter">Center of the floorplan bounding box.</param>
         /// <param name="bounds">Combined bounds of all generated meshes.</param>
         /// <param name="onComplete">Called when the transition finishes.</param>
-        public void LerpToPerspective(Vector3 targetCenter, Bounds bounds, Action onComplete)
+        public void LerpToPerspective(Vector3 targetCenter, Bounds bounds, Action onComplete, Action<float> onProgress = null)
         {
-            StartCoroutine(TransitionCoroutine(targetCenter, bounds, onComplete));
+            StartCoroutine(TransitionCoroutine(targetCenter, bounds, onComplete, onProgress));
         }
 
-        IEnumerator TransitionCoroutine(Vector3 center, Bounds bounds, Action onComplete)
+        IEnumerator TransitionCoroutine(Vector3 center, Bounds bounds, Action onComplete, Action<float> onProgress)
         {
             _orbitTarget = Vector3.zero;
-            _orbitDistance = bounds.extents.magnitude * 2.5f;
+            _orbitDistance = bounds.extents.magnitude * 1.25f;
             _targetOrbitDistance = _orbitDistance;
             _currentYaw = 45f; // Start at a nice angle
             _currentPitch = orbitElevation; // Start at the default elevation
@@ -108,6 +108,7 @@ namespace FloorplanVectoriser.CameraSystem
                 transform.position = Vector3.Lerp(startPos, endPos, smooth);
                 transform.rotation = Quaternion.Slerp(startRot, endRot, smooth);
                 _cam.fieldOfView = Mathf.Lerp(startFOV, perspectiveFOV, smooth);
+                onProgress?.Invoke(smooth);
 
                 elapsed += Time.deltaTime;
                 yield return null;

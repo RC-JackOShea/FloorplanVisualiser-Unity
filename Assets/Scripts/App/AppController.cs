@@ -12,6 +12,7 @@ using FloorplanVectoriser.PostProcessing;
 using TMPro;
 using UnityEngine;
 using UnityEngine.InputSystem;
+using UnityEngine.SceneManagement;
 using UnityEngine.UI;
 
 namespace FloorplanVectoriser.App
@@ -32,6 +33,8 @@ namespace FloorplanVectoriser.App
         [SerializeField] private Material wallMaterial;
         [SerializeField] private Material doorMaterial;
         [SerializeField] private Material windowMaterial;
+        [Tooltip("Base unlit material cloned for debug visuals. Create a URP Unlit material and assign it here.")]
+        [SerializeField] private Material unlitBaseMaterial;
 
         [Header("Mesh Settings")]
         [SerializeField] private float worldScale = 10f;
@@ -41,6 +44,12 @@ namespace FloorplanVectoriser.App
 
         [Header("Mesh Animation")]
         [SerializeField] private float meshScaleUpDuration = 0.6f;
+
+        [Header("Reveal Animation")]
+        [Tooltip("How long each element takes to scale from 0 to full size")]
+        [SerializeField] private float revealPopDuration = 0.15f;
+        [Tooltip("Delay between each element starting its pop-in (lower = more overlap)")]
+        [SerializeField] private float revealStaggerDelay = 0.05f;
 
         [Header("Post-Processing")]
         [Tooltip("Confidence threshold for wall/door/window detection (lower = more detections, may include false positives)")]
@@ -59,6 +68,8 @@ namespace FloorplanVectoriser.App
         [SerializeField] private bool showWeldedPoints = true;
         [SerializeField] private bool showSplinePoints = true;
         [SerializeField] private bool showIntersectionPoints = true;
+        [Tooltip("When false, text labels are not created for debug spheres and connection lines are not revealed before walls")]
+        [SerializeField] private bool showDebugLabels = true;
         [Tooltip("Max distance (m) to weld nearby wall segment endpoints together")]
         [SerializeField] private float weldTolerance = 0.25f;
 
@@ -86,6 +97,7 @@ namespace FloorplanVectoriser.App
         [SerializeField] private Button innerWallsButton;
         [SerializeField] private Button splinePointsButton;
         [SerializeField] private Button doorsWindowsButton;
+        [SerializeField] private Button previewPlaneButton;
 
         [Header("UI - Wall Measurement")]
         [SerializeField] private GameObject measurementUI;
@@ -96,6 +108,7 @@ namespace FloorplanVectoriser.App
         GameObject _generatedMeshRoot;
         GameObject _debugRoot;
         SketchFile _lastSketch;
+        static Mesh _sharedSphereMesh;
         string _lastSketchJson;
 
         // Category containers for toggle visibility
@@ -107,11 +120,18 @@ namespace FloorplanVectoriser.App
         // Toggle state tracking
         bool _outerWallsVisible = true;
         bool _innerWallsVisible = true;
-        bool _splinePointsVisible = false;
+        bool _splinePointsVisible = true;
         bool _doorsWindowsVisible = true;
+        bool _previewPlaneVisible = true;
 
         static readonly Color ToggleOnColor = new Color(0.2f, 0.8f, 0.2f);
         static readonly Color ToggleOffColor = new Color(0.8f, 0.2f, 0.2f);
+
+        // Reveal animation lists (populated during creation, animated on Viewing enter)
+        readonly System.Collections.Generic.List<(Transform obj, float targetScale)> _junctionReveals = new();
+        readonly System.Collections.Generic.List<(Transform obj, float targetScale)> _doorReveals = new();
+        readonly System.Collections.Generic.List<(Transform obj, float targetScale)> _windowReveals = new();
+        readonly System.Collections.Generic.List<(LineRenderer lr, Vector3 start, Vector3 end)> _connectionLineReveals = new();
 
         // Wall selection state
         GameObject _selectedWall;
@@ -137,14 +157,15 @@ namespace FloorplanVectoriser.App
             if (innerWallsButton != null) innerWallsButton.onClick.AddListener(() => ToggleCategory(ref _innerWallsVisible, _innerWallsContainer, innerWallsButton));
             if (splinePointsButton != null) splinePointsButton.onClick.AddListener(() => ToggleCategory(ref _splinePointsVisible, _junctionsContainer, splinePointsButton));
             if (doorsWindowsButton != null) doorsWindowsButton.onClick.AddListener(() => ToggleCategory(ref _doorsWindowsVisible, _doorsWindowsContainer, doorsWindowsButton));
+            if (previewPlaneButton != null) previewPlaneButton.onClick.AddListener(TogglePreviewPlane);
 
             // Wall measurement
             if (applyMeasurementButton != null) applyMeasurementButton.onClick.AddListener(OnApplyMeasurement);
             SetActive(measurementUI, false);
 
             // Highlight material (created once)
-            _highlightMaterial = new Material(Shader.Find("Universal Render Pipeline/Unlit"));
-            _highlightMaterial.color = new Color(0f, 1f, 1f); // cyan
+            _highlightMaterial = new Material(unlitBaseMaterial);
+            _highlightMaterial.SetColor("_BaseColor", new Color(0f, 1f, 1f)); // cyan
 
             TransitionTo(AppState.CameraPreview);
         }
@@ -191,8 +212,13 @@ namespace FloorplanVectoriser.App
                     _doorsWindowsContainer = null;
                     _outerWallsVisible = true;
                     _innerWallsVisible = true;
-                    _splinePointsVisible = false;
+                    _splinePointsVisible = true;
                     _doorsWindowsVisible = true;
+                    _previewPlaneVisible = true;
+                    _junctionReveals.Clear();
+                    _doorReveals.Clear();
+                    _windowReveals.Clear();
+                    _connectionLineReveals.Clear();
                     break;
 
                 case AppState.ImageReview:
@@ -218,13 +244,16 @@ namespace FloorplanVectoriser.App
 
                 case AppState.Viewing:
                     // Orbit is enabled by CameraController after transition
+                    // Preview plane was faded to 10% during camera transition
+                    _previewPlaneVisible = false;
                     SetActive(viewingUI, true);
                     UpdateToggleButtonColor(outerWallsButton, _outerWallsVisible);
                     UpdateToggleButtonColor(innerWallsButton, _innerWallsVisible);
                     UpdateToggleButtonColor(splinePointsButton, _splinePointsVisible);
                     UpdateToggleButtonColor(doorsWindowsButton, _doorsWindowsVisible);
-                    // Scale up wall meshes now that camera is in position
-                    StartCoroutine(AnimateMeshScaleUp(null));
+                    UpdateToggleButtonColor(previewPlaneButton, _previewPlaneVisible);
+                    // Sequenced reveal: points → lines → doors → windows → walls
+                    StartCoroutine(RevealSequence());
                     break;
             }
         }
@@ -267,10 +296,7 @@ namespace FloorplanVectoriser.App
 
         void OnResetPressed()
         {
-            if (_currentState != AppState.Viewing) return;
-            // Stop orbit and go back to camera preview to start fresh
-            cameraController.StopOrbit();
-            TransitionTo(AppState.CameraPreview);
+            SceneManager.LoadScene(SceneManager.GetActiveScene().buildIndex);
         }
 
         void OnSavePressed()
@@ -294,7 +320,7 @@ namespace FloorplanVectoriser.App
 
             // Detect tap (not drag) for wall selection using new Input System
             // Touch input
-            if (Touchscreen.current != null && Touchscreen.current.primaryTouch.press.isPressed)
+            if (Touchscreen.current != null)
             {
                 if (Touchscreen.current.primaryTouch.press.wasPressedThisFrame)
                     _pointerDownPos = Touchscreen.current.primaryTouch.position.ReadValue();
@@ -529,7 +555,6 @@ namespace FloorplanVectoriser.App
                 // Category containers for toggle visibility
                 var junctionsContainer = new GameObject("Junctions");
                 junctionsContainer.transform.SetParent(debugRoot.transform);
-                junctionsContainer.SetActive(false);
                 _junctionsContainer = junctionsContainer;
 
                 var doorsWindowsContainer = new GameObject("DoorsWindows");
@@ -544,20 +569,23 @@ namespace FloorplanVectoriser.App
                 // Junction points (blue spheres with J[n] labels — IDs match extraction data)
                 if (showSplinePoints)
                 {
-                    var blueMat = new Material(Shader.Find("Universal Render Pipeline/Unlit"));
-                    blueMat.color = Color.blue;
+                    var blueMat = new Material(unlitBaseMaterial);
+                    blueMat.SetColor("_BaseColor", Color.blue);
 
                     foreach (var junction in extraction.Junctions)
                     {
-                        var sphere = GameObject.CreatePrimitive(PrimitiveType.Sphere);
-                        sphere.name = $"J[{junction.Id}]";
+                        var sphere = CreateDebugSphere($"J[{junction.Id}]", blueMat);
                         sphere.transform.SetParent(junctionsContainer.transform);
                         sphere.transform.localPosition = junction.Position;
-                        sphere.transform.localScale = Vector3.one * 0.25f;
-                        sphere.GetComponent<Renderer>().sharedMaterial = blueMat;
-                        Destroy(sphere.GetComponent<Collider>());
+                        sphere.transform.localScale = Vector3.zero;
+                        _junctionReveals.Add((sphere.transform, 0.25f));
 
-                        CreateDebugLabel($"J{junction.Id}", junction.Position, junctionsContainer.transform, Color.blue);
+                        if (showDebugLabels)
+                        {
+                            var label = CreateDebugLabel($"J{junction.Id}", junction.Position, junctionsContainer.transform, Color.blue);
+                            label.transform.localScale = Vector3.zero;
+                            _junctionReveals.Add((label.transform, 1f));
+                        }
                     }
 
                     Debug.Log($"[Debug] {extraction.Junctions.Count} junction points (blue)");
@@ -565,10 +593,10 @@ namespace FloorplanVectoriser.App
 
                 // Connection lines (green = interior, red = outer boundary)
                 {
-                    var connMat = new Material(Shader.Find("Universal Render Pipeline/Unlit"));
-                    connMat.color = Color.green;
-                    var outerMat = new Material(Shader.Find("Universal Render Pipeline/Unlit"));
-                    outerMat.color = Color.red;
+                    var connMat = new Material(unlitBaseMaterial);
+                    connMat.SetColor("_BaseColor", Color.green);
+                    var outerMat = new Material(unlitBaseMaterial);
+                    outerMat.SetColor("_BaseColor", Color.red);
 
                     const float buffer = 0.15f; // pull line ends away from junction centres
 
@@ -593,15 +621,21 @@ namespace FloorplanVectoriser.App
                         lr.useWorldSpace = false;
                         lr.positionCount = 2;
                         lr.SetPosition(0, lineStart);
-                        lr.SetPosition(1, lineEnd);
-                        lr.startWidth = 0.06f;
-                        lr.endWidth = 0.06f;
+                        lr.SetPosition(1, lineStart); // start collapsed — will be drawn during reveal
+                        lr.startWidth = 0.12f;
+                        lr.endWidth = 0.12f;
                         lr.material = isOuter ? outerMat : connMat;
+                        _connectionLineReveals.Add((lr, lineStart, lineEnd));
 
                         // Label at midpoint
-                        Vector3 mid = (posA + posB) * 0.5f;
-                        Color labelColor = isOuter ? Color.red : Color.green;
-                        CreateDebugLabel($"C{conn.Id}", mid, junctionsContainer.transform, labelColor, 2f);
+                        if (showDebugLabels)
+                        {
+                            Vector3 mid = (posA + posB) * 0.5f;
+                            Color labelColor = isOuter ? Color.red : Color.green;
+                            var connLabel = CreateDebugLabel($"C{conn.Id}", mid, junctionsContainer.transform, labelColor, 2f);
+                            connLabel.transform.localScale = Vector3.zero;
+                            _junctionReveals.Add((connLabel.transform, 1f));
+                        }
                     }
 
                     Debug.Log($"[Debug] {extraction.Connections.Count} connections ({outerCount} outer/red, {extraction.Connections.Count - outerCount} interior/green)");
@@ -610,21 +644,24 @@ namespace FloorplanVectoriser.App
                 // Intersection points (yellow spheres with IX[n] labels)
                 if (showIntersectionPoints && extraction.Intersections.Count > 0)
                 {
-                    var yellowMat = new Material(Shader.Find("Universal Render Pipeline/Unlit"));
-                    yellowMat.color = Color.yellow;
+                    var yellowMat = new Material(unlitBaseMaterial);
+                    yellowMat.SetColor("_BaseColor", Color.yellow);
 
                     for (int i = 0; i < extraction.Intersections.Count; i++)
                     {
                         var ix = extraction.Intersections[i];
-                        var sphere = GameObject.CreatePrimitive(PrimitiveType.Sphere);
-                        sphere.name = $"IX[{i}] (Seg{ix.SegmentA} x Seg{ix.SegmentB})";
+                        var sphere = CreateDebugSphere($"IX[{i}] (Seg{ix.SegmentA} x Seg{ix.SegmentB})", yellowMat);
                         sphere.transform.SetParent(junctionsContainer.transform);
                         sphere.transform.localPosition = ix.Position;
-                        sphere.transform.localScale = Vector3.one * 0.3f;
-                        sphere.GetComponent<Renderer>().sharedMaterial = yellowMat;
-                        Destroy(sphere.GetComponent<Collider>());
+                        sphere.transform.localScale = Vector3.zero;
+                        _junctionReveals.Add((sphere.transform, 0.3f));
 
-                        CreateDebugLabel($"IX{i}", ix.Position, junctionsContainer.transform, Color.yellow);
+                        if (showDebugLabels)
+                        {
+                            var ixLabel = CreateDebugLabel($"IX{i}", ix.Position, junctionsContainer.transform, Color.yellow);
+                            ixLabel.transform.localScale = Vector3.zero;
+                            _junctionReveals.Add((ixLabel.transform, 1f));
+                        }
                     }
 
                     Debug.Log($"[Debug] {extraction.Intersections.Count} intersection points (yellow)");
@@ -633,40 +670,46 @@ namespace FloorplanVectoriser.App
                 // Door positions (yellow spheres)
                 if (doorPositions.Count > 0)
                 {
-                    var doorMat = new Material(Shader.Find("Universal Render Pipeline/Unlit"));
-                    doorMat.color = Color.yellow;
+                    var doorMat = new Material(unlitBaseMaterial);
+                    doorMat.SetColor("_BaseColor", Color.yellow);
 
                     for (int i = 0; i < doorPositions.Count; i++)
                     {
-                        var sphere = GameObject.CreatePrimitive(PrimitiveType.Sphere);
-                        sphere.name = $"Door[{i}]";
+                        var sphere = CreateDebugSphere($"Door[{i}]", doorMat);
                         sphere.transform.SetParent(doorsWindowsContainer.transform);
                         sphere.transform.localPosition = doorPositions[i];
-                        sphere.transform.localScale = Vector3.one * 0.2f;
-                        sphere.GetComponent<Renderer>().sharedMaterial = doorMat;
-                        Destroy(sphere.GetComponent<Collider>());
+                        sphere.transform.localScale = Vector3.zero;
+                        _doorReveals.Add((sphere.transform, 0.2f));
 
-                        CreateDebugLabel($"D{i}", doorPositions[i], doorsWindowsContainer.transform, Color.yellow);
+                        if (showDebugLabels)
+                        {
+                            var doorLabel = CreateDebugLabel($"D{i}", doorPositions[i], doorsWindowsContainer.transform, Color.yellow);
+                            doorLabel.transform.localScale = Vector3.zero;
+                            _doorReveals.Add((doorLabel.transform, 1f));
+                        }
                     }
                 }
 
                 // Window positions (purple spheres)
                 if (windowPositions.Count > 0)
                 {
-                    var winMat = new Material(Shader.Find("Universal Render Pipeline/Unlit"));
-                    winMat.color = new Color(0.6f, 0f, 0.8f); // purple
+                    var winMat = new Material(unlitBaseMaterial);
+                    winMat.SetColor("_BaseColor", Color.green);
 
                     for (int i = 0; i < windowPositions.Count; i++)
                     {
-                        var sphere = GameObject.CreatePrimitive(PrimitiveType.Sphere);
-                        sphere.name = $"Window[{i}]";
+                        var sphere = CreateDebugSphere($"Window[{i}]", winMat);
                         sphere.transform.SetParent(doorsWindowsContainer.transform);
                         sphere.transform.localPosition = windowPositions[i];
-                        sphere.transform.localScale = Vector3.one * 0.2f;
-                        sphere.GetComponent<Renderer>().sharedMaterial = winMat;
-                        Destroy(sphere.GetComponent<Collider>());
+                        sphere.transform.localScale = Vector3.zero;
+                        _windowReveals.Add((sphere.transform, 0.2f));
 
-                        CreateDebugLabel($"W{i}", windowPositions[i], doorsWindowsContainer.transform, Color.magenta);
+                        if (showDebugLabels)
+                        {
+                            var winLabel = CreateDebugLabel($"W{i}", windowPositions[i], doorsWindowsContainer.transform, Color.magenta);
+                            winLabel.transform.localScale = Vector3.zero;
+                            _windowReveals.Add((winLabel.transform, 1f));
+                        }
                     }
                 }
 
@@ -690,6 +733,12 @@ namespace FloorplanVectoriser.App
                 var innerWallsContainer = new GameObject("InnerWalls");
                 innerWallsContainer.transform.SetParent(meshRoot.transform);
                 _innerWallsContainer = innerWallsContainer;
+
+                var doorMeshContainer = new GameObject("DoorMeshes");
+                doorMeshContainer.transform.SetParent(meshRoot.transform);
+
+                var windowMeshContainer = new GameObject("WindowMeshes");
+                windowMeshContainer.transform.SetParent(meshRoot.transform);
 
                 foreach (var conn in extraction.Connections)
                 {
@@ -812,6 +861,77 @@ namespace FloorplanVectoriser.App
                               $"(from {interiorConns.Count} connections, merged into {chains.Count} chains)");
                 }
 
+                // Generate door and window meshes oriented along nearest wall
+                {
+                    // Build list of wall segments (start, end) from all connections for nearest-wall lookup
+                    var wallLines = new System.Collections.Generic.List<(Vector3 a, Vector3 b, float thickness)>();
+                    foreach (var conn in extraction.Connections)
+                    {
+                        if (!junctionPos.TryGetValue(conn.JunctionA, out var a)) continue;
+                        if (!junctionPos.TryGetValue(conn.JunctionB, out var b)) continue;
+                        wallLines.Add((a, b, conn.Thickness));
+                    }
+
+                    // Door meshes
+                    float doorWidth = 0.4f;
+                    float doorHeight = extrudeHeight * 0.85f;
+                    for (int i = 0; i < doorPositions.Count; i++)
+                    {
+                        var pos = doorPositions[i];
+                        FindNearestWall(pos, wallLines, out Vector3 wallDir, out float wallThick);
+                        Vector3 perp = new Vector3(-wallDir.z, 0f, wallDir.x);
+                        float halfW = doorWidth * 0.5f;
+                        float halfT = Mathf.Max(wallThick * 0.5f, 0.05f) + 0.01f; // slightly thicker than wall
+
+                        // Width along wallDir, thickness along perp (same pattern as wall meshes)
+                        Vector3[] bottom = {
+                            pos - wallDir * halfW - perp * halfT,
+                            pos - wallDir * halfW + perp * halfT,
+                            pos + wallDir * halfW + perp * halfT,
+                            pos + wallDir * halfW - perp * halfT
+                        };
+                        Vector3[] top = new Vector3[4];
+                        for (int j = 0; j < 4; j++)
+                            top[j] = bottom[j] + Vector3.up * doorHeight;
+
+                        var doorObj = new GameObject($"DoorMesh[{i}]");
+                        doorObj.transform.SetParent(doorMeshContainer.transform);
+                        doorObj.AddComponent<MeshFilter>().mesh = BuildBoxMesh(bottom, top);
+                        doorObj.AddComponent<MeshRenderer>().material = doorMaterial;
+                    }
+
+                    // Window meshes
+                    float windowWidth = 0.35f;
+                    float windowBottom = extrudeHeight * 0.35f;
+                    float windowTop = extrudeHeight * 0.75f;
+                    for (int i = 0; i < windowPositions.Count; i++)
+                    {
+                        var pos = windowPositions[i];
+                        FindNearestWall(pos, wallLines, out Vector3 wallDir, out float wallThick);
+                        Vector3 perp = new Vector3(-wallDir.z, 0f, wallDir.x);
+                        float halfW = windowWidth * 0.5f;
+                        float halfT = Mathf.Max(wallThick * 0.5f, 0.05f) + 0.01f;
+
+                        // Width along wallDir, thickness along perp
+                        Vector3[] bottom = {
+                            pos + Vector3.up * windowBottom - wallDir * halfW - perp * halfT,
+                            pos + Vector3.up * windowBottom - wallDir * halfW + perp * halfT,
+                            pos + Vector3.up * windowBottom + wallDir * halfW + perp * halfT,
+                            pos + Vector3.up * windowBottom + wallDir * halfW - perp * halfT
+                        };
+                        Vector3[] top = new Vector3[4];
+                        for (int j = 0; j < 4; j++)
+                            top[j] = bottom[j] + Vector3.up * (windowTop - windowBottom);
+
+                        var winObj = new GameObject($"WindowMesh[{i}]");
+                        winObj.transform.SetParent(windowMeshContainer.transform);
+                        winObj.AddComponent<MeshFilter>().mesh = BuildBoxMesh(bottom, top);
+                        winObj.AddComponent<MeshRenderer>().material = windowMaterial;
+                    }
+
+                    Debug.Log($"[Mesh] Generated {doorPositions.Count} door meshes, {windowPositions.Count} window meshes");
+                }
+
                 // Apply scale AFTER all children are added, so SetParent doesn't
                 // compensate child local scale to counteract the parent transform
                 meshRoot.transform.localScale = new Vector3(scaleX, 1f, scaleZ);
@@ -825,10 +945,180 @@ namespace FloorplanVectoriser.App
             cameraController.LerpToPerspective(viewBounds.center, viewBounds, () =>
             {
                 TransitionTo(AppState.Viewing);
+            }, t =>
+            {
+                // Fade preview plane from 100% to 10% during camera transition
+                SetPreviewPlaneOpacity(Mathf.Lerp(1f, 0.1f, t));
             });
         }
 
         // --- Helpers ---
+
+        IEnumerator RevealSequence()
+        {
+            // Phase 1: Junction/spline points pop in one by one
+            yield return StartCoroutine(PopInElements(_junctionReveals));
+
+            // Phase 2: Connection lines draw in one by one
+            yield return StartCoroutine(RevealConnectionLines());
+
+            // Phase 3: Door dots pop in one by one
+            yield return StartCoroutine(PopInElements(_doorReveals));
+
+            // Phase 4: Window dots pop in one by one
+            yield return StartCoroutine(PopInElements(_windowReveals));
+
+            // Phase 5: Walls rise from the ground
+            yield return StartCoroutine(AnimateMeshScaleUp(null));
+
+            // Phase 6: Shrink all debug elements in unison, then disable their toggles
+            yield return StartCoroutine(ShrinkAllDebugElements());
+
+            // Reset elements to full size so toggles show them instantly
+            RestoreDebugElementScales();
+
+            // Hide containers and update toggle states
+            _splinePointsVisible = false;
+            _doorsWindowsVisible = false;
+            SetActive(_junctionsContainer, false);
+            SetActive(_doorsWindowsContainer, false);
+            UpdateToggleButtonColor(splinePointsButton, false);
+            UpdateToggleButtonColor(doorsWindowsButton, false);
+        }
+
+        IEnumerator ShrinkAllDebugElements()
+        {
+            // Combine all debug element lists for a unified shrink
+            var allElements = new System.Collections.Generic.List<(Transform obj, float targetScale)>();
+            allElements.AddRange(_junctionReveals);
+            allElements.AddRange(_doorReveals);
+            allElements.AddRange(_windowReveals);
+
+            if (allElements.Count == 0) yield break;
+
+            // Also shrink connection lines simultaneously
+            float elapsed = 0f;
+            while (elapsed < revealPopDuration)
+            {
+                float t = Mathf.SmoothStep(0f, 1f, elapsed / revealPopDuration);
+                foreach (var (obj, scale) in allElements)
+                {
+                    if (obj != null)
+                        obj.localScale = Vector3.Lerp(Vector3.one * scale, Vector3.zero, t);
+                }
+                foreach (var (lr, start, end) in _connectionLineReveals)
+                {
+                    if (lr != null)
+                    {
+                        float w = Mathf.Lerp(0.12f, 0f, t);
+                        lr.startWidth = w;
+                        lr.endWidth = w;
+                    }
+                }
+                elapsed += Time.deltaTime;
+                yield return null;
+            }
+
+            // Snap to zero
+            foreach (var (obj, _) in allElements)
+            {
+                if (obj != null) obj.localScale = Vector3.zero;
+            }
+            foreach (var (lr, _, _) in _connectionLineReveals)
+            {
+                if (lr != null) { lr.startWidth = 0f; lr.endWidth = 0f; }
+            }
+        }
+
+        /// <summary>
+        /// Restore all debug element scales to their full target size so that
+        /// toggling visibility back on shows them instantly without re-animating.
+        /// </summary>
+        void RestoreDebugElementScales()
+        {
+            foreach (var (obj, scale) in _junctionReveals)
+            {
+                if (obj != null) obj.localScale = Vector3.one * scale;
+            }
+            foreach (var (obj, scale) in _doorReveals)
+            {
+                if (obj != null) obj.localScale = Vector3.one * scale;
+            }
+            foreach (var (obj, scale) in _windowReveals)
+            {
+                if (obj != null) obj.localScale = Vector3.one * scale;
+            }
+            foreach (var (lr, start, end) in _connectionLineReveals)
+            {
+                if (lr != null)
+                {
+                    lr.SetPosition(1, end);
+                    lr.startWidth = 0.12f;
+                    lr.endWidth = 0.12f;
+                }
+            }
+        }
+
+        IEnumerator PopInElements(System.Collections.Generic.List<(Transform obj, float targetScale)> elements)
+        {
+            if (elements.Count == 0) yield break;
+
+            for (int i = 0; i < elements.Count; i++)
+            {
+                var (obj, target) = elements[i];
+                if (obj != null)
+                    StartCoroutine(ScaleElement(obj, target));
+                yield return new WaitForSeconds(revealStaggerDelay);
+            }
+            // Wait for the last element to finish its pop
+            yield return new WaitForSeconds(revealPopDuration);
+        }
+
+        IEnumerator ScaleElement(Transform obj, float targetScale)
+        {
+            float elapsed = 0f;
+            Vector3 target = Vector3.one * targetScale;
+            while (elapsed < revealPopDuration)
+            {
+                if (obj == null) yield break;
+                float t = Mathf.SmoothStep(0f, 1f, elapsed / revealPopDuration);
+                obj.localScale = Vector3.Lerp(Vector3.zero, target, t);
+                elapsed += Time.deltaTime;
+                yield return null;
+            }
+            if (obj != null)
+                obj.localScale = target;
+        }
+
+        IEnumerator RevealConnectionLines()
+        {
+            if (_connectionLineReveals.Count == 0) yield break;
+
+            for (int i = 0; i < _connectionLineReveals.Count; i++)
+            {
+                var (lr, start, end) = _connectionLineReveals[i];
+                if (lr != null)
+                    StartCoroutine(DrawLine(lr, start, end));
+                yield return new WaitForSeconds(revealStaggerDelay);
+            }
+            // Wait for the last line to finish drawing
+            yield return new WaitForSeconds(revealPopDuration);
+        }
+
+        IEnumerator DrawLine(LineRenderer lr, Vector3 start, Vector3 end)
+        {
+            float elapsed = 0f;
+            while (elapsed < revealPopDuration)
+            {
+                if (lr == null) yield break;
+                float t = Mathf.SmoothStep(0f, 1f, elapsed / revealPopDuration);
+                lr.SetPosition(1, Vector3.Lerp(start, end, t));
+                elapsed += Time.deltaTime;
+                yield return null;
+            }
+            if (lr != null)
+                lr.SetPosition(1, end);
+        }
 
         IEnumerator AnimateMeshScaleUp(Action onComplete)
         {
@@ -864,6 +1154,48 @@ namespace FloorplanVectoriser.App
             visible = !visible;
             SetActive(container, visible);
             UpdateToggleButtonColor(button, visible);
+        }
+
+        Coroutine _previewFadeCoroutine;
+
+        void TogglePreviewPlane()
+        {
+            _previewPlaneVisible = !_previewPlaneVisible;
+            UpdateToggleButtonColor(previewPlaneButton, _previewPlaneVisible);
+            float target = _previewPlaneVisible ? 1f : 0.05f;
+            if (_previewFadeCoroutine != null)
+                StopCoroutine(_previewFadeCoroutine);
+            _previewFadeCoroutine = StartCoroutine(LerpPreviewPlaneOpacity(target));
+        }
+
+        void SetPreviewPlaneOpacity(float opacity)
+        {
+            var plane = imageCapture.GetPreviewPlane();
+            if (plane == null) return;
+            var renderer = plane.GetComponent<Renderer>();
+            if (renderer != null && renderer.material != null)
+                renderer.material.SetFloat("_Opacity", opacity);
+        }
+
+        IEnumerator LerpPreviewPlaneOpacity(float target)
+        {
+            var plane = imageCapture.GetPreviewPlane();
+            if (plane == null) yield break;
+            var renderer = plane.GetComponent<Renderer>();
+            if (renderer == null || renderer.material == null) yield break;
+
+            float start = renderer.material.GetFloat("_Opacity");
+            float elapsed = 0f;
+            float duration = 0.4f;
+            while (elapsed < duration)
+            {
+                float t = Mathf.SmoothStep(0f, 1f, elapsed / duration);
+                renderer.material.SetFloat("_Opacity", Mathf.Lerp(start, target, t));
+                elapsed += Time.deltaTime;
+                yield return null;
+            }
+            renderer.material.SetFloat("_Opacity", target);
+            _previewFadeCoroutine = null;
         }
 
         static void UpdateToggleButtonColor(Button button, bool visible)
@@ -971,6 +1303,36 @@ namespace FloorplanVectoriser.App
             tris.Add(start); tris.Add(start + 2); tris.Add(start + 3);
         }
 
+        /// <summary>
+        /// Find the nearest wall segment to a point and return its direction and thickness.
+        /// </summary>
+        static void FindNearestWall(Vector3 point, System.Collections.Generic.List<(Vector3 a, Vector3 b, float thickness)> walls,
+            out Vector3 wallDir, out float wallThickness)
+        {
+            wallDir = Vector3.right;
+            wallThickness = 0.1f;
+            float bestDist = float.MaxValue;
+
+            foreach (var (a, b, thick) in walls)
+            {
+                // Project point onto line segment a→b, find closest point
+                Vector3 ab = b - a;
+                float len = ab.magnitude;
+                if (len < 0.001f) continue;
+                Vector3 abNorm = ab / len;
+                float t = Mathf.Clamp(Vector3.Dot(point - a, abNorm), 0f, len);
+                Vector3 closest = a + abNorm * t;
+                float dist = Vector3.Distance(new Vector3(point.x, 0f, point.z),
+                                              new Vector3(closest.x, 0f, closest.z));
+                if (dist < bestDist)
+                {
+                    bestDist = dist;
+                    wallDir = abNorm;
+                    wallThickness = thick;
+                }
+            }
+        }
+
         static int CountByCategory(PolygonResult result, StructureCategory cat)
         {
             int count = 0;
@@ -983,6 +1345,21 @@ namespace FloorplanVectoriser.App
         /// Create a world-space TextMeshPro label above a debug sphere.
         /// The label faces the camera via the BillboardLabel component.
         /// </summary>
+        static GameObject CreateDebugSphere(string name, Material mat)
+        {
+            if (_sharedSphereMesh == null)
+            {
+                var tmp = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+                _sharedSphereMesh = tmp.GetComponent<MeshFilter>().sharedMesh;
+                Destroy(tmp);
+            }
+
+            var go = new GameObject(name);
+            go.AddComponent<MeshFilter>().sharedMesh = _sharedSphereMesh;
+            go.AddComponent<MeshRenderer>().sharedMaterial = mat;
+            return go;
+        }
+
         static GameObject CreateDebugLabel(string text, Vector3 localPos, Transform parent, Color color, float fontSize = 3f)
         {
             var labelObj = new GameObject($"Label_{text}");
