@@ -105,7 +105,7 @@ namespace FloorplanVectoriser.Conversion
             {
                 var uncoveredSegments = new List<WallSegment>(extraction.UncoveredSegmentIndices.Count);
                 foreach (int idx in extraction.UncoveredSegmentIndices)
-                    uncoveredSegments.Add(segments[idx]);
+                    uncoveredSegments.Add(extraction.SplitSegments[idx]);
 
                 var extraChains = GreedyBuildChains(uncoveredSegments, connectionThreshold);
 

@@ -54,6 +54,7 @@ namespace FloorplanVectoriser.App
         [SerializeField] private bool showDebugPoints = true;
         [SerializeField] private bool showWeldedPoints = true;
         [SerializeField] private bool showSplinePoints = true;
+        [SerializeField] private bool showIntersectionPoints = true;
         [Tooltip("Max distance (m) to weld nearby wall segment endpoints together")]
         [SerializeField] private float weldTolerance = 0.25f;
 
@@ -270,12 +271,14 @@ namespace FloorplanVectoriser.App
                 foreach (var poly in result.Polygons)
                     if (poly.Category == StructureCategory.Wall) walls.Add(poly);
 
-                // Collect all endpoints
+                // Collect all endpoints and segments
                 var endpoints = new System.Collections.Generic.List<Vector3>(walls.Count * 2);
                 var endpointLabels = new System.Collections.Generic.List<string>(walls.Count * 2);
+                var wallSegments = new System.Collections.Generic.List<WallChainBuilder.WallSegment>(walls.Count);
                 for (int i = 0; i < walls.Count; i++)
                 {
                     var seg = WallChainBuilder.ExtractCenterline(walls[i], photoCaptureSize);
+                    wallSegments.Add(seg);
                     endpoints.Add(seg.Start);
                     endpointLabels.Add($"Seg[{i}]_Start");
                     endpoints.Add(seg.End);
@@ -383,6 +386,30 @@ namespace FloorplanVectoriser.App
                     }
 
                     Debug.Log($"[Debug] {splineIdx} spline points (blue)");
+                }
+
+                // Intersection points: where two segments cross mid-segment (yellow)
+                if (showIntersectionPoints)
+                {
+                    var intersections = RoomOutlineExtractor.FindIntersections(wallSegments, weldTolerance);
+                    if (intersections.Count > 0)
+                    {
+                        var yellowMat = new Material(Shader.Find("Universal Render Pipeline/Unlit"));
+                        yellowMat.color = Color.yellow;
+
+                        for (int i = 0; i < intersections.Count; i++)
+                        {
+                            var sphere = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+                            sphere.name = $"Intersection[{i}] (Seg{intersections[i].SegmentA} x Seg{intersections[i].SegmentB})";
+                            sphere.transform.SetParent(debugRoot.transform);
+                            sphere.transform.localPosition = intersections[i].Position;
+                            sphere.transform.localScale = Vector3.one * 0.3f;
+                            sphere.GetComponent<Renderer>().sharedMaterial = yellowMat;
+                            Destroy(sphere.GetComponent<Collider>());
+                        }
+
+                        Debug.Log($"[Debug] {intersections.Count} intersection points (yellow)");
+                    }
                 }
 
                 debugRoot.transform.localScale = new Vector3(scaleX, 1f, scaleZ);

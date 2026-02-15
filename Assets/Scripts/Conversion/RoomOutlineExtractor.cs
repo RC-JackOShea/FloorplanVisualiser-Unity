@@ -28,13 +28,36 @@ namespace FloorplanVectoriser.Conversion
         }
 
         /// <summary>
+        /// A point where two wall segments cross each other mid-segment.
+        /// Stored separately from endpoint-based junctions.
+        /// </summary>
+        public struct IntersectionPoint
+        {
+            /// <summary>World-space position of the crossing (Y=0 plane).</summary>
+            public Vector3 Position;
+            /// <summary>Index of the first crossing segment in the original list.</summary>
+            public int SegmentA;
+            /// <summary>Index of the second crossing segment in the original list.</summary>
+            public int SegmentB;
+            /// <summary>Parametric t along segment A at the crossing.</summary>
+            public float tA;
+            /// <summary>Parametric t along segment B at the crossing.</summary>
+            public float tB;
+        }
+
+        /// <summary>
         /// Result of the extraction: room outlines plus indices of segments
-        /// that weren't included in any room face.
+        /// that weren't included in any room face, plus intersection points.
         /// </summary>
         public struct ExtractionResult
         {
             public List<RoomOutline> Rooms;
             public List<int> UncoveredSegmentIndices;
+            /// <summary>Points where wall segments cross each other (separate from endpoint junctions).</summary>
+            public List<IntersectionPoint> Intersections;
+            /// <summary>The segment list used for graph building (after intersection splitting).
+            /// UncoveredSegmentIndices refers to this list, not the original input.</summary>
+            public List<WallChainBuilder.WallSegment> SplitSegments;
         }
 
         /// <summary>
@@ -50,7 +73,9 @@ namespace FloorplanVectoriser.Conversion
             var emptyResult = new ExtractionResult
             {
                 Rooms = new List<RoomOutline>(),
-                UncoveredSegmentIndices = new List<int>()
+                UncoveredSegmentIndices = new List<int>(),
+                Intersections = new List<IntersectionPoint>(),
+                SplitSegments = segments
             };
 
             if (segments.Count < 3)
@@ -60,6 +85,11 @@ namespace FloorplanVectoriser.Conversion
                     emptyResult.UncoveredSegmentIndices.Add(i);
                 return emptyResult;
             }
+
+            // 0. Detect segment-segment intersections and split at crossing points
+            var intersections = FindIntersections(segments, connectionThreshold);
+            var splitSegments = SplitSegmentsAtIntersections(segments, intersections);
+            segments = splitSegments;
 
             // 1. Collect all endpoints
             int epCount = segments.Count * 2;
@@ -306,7 +336,9 @@ namespace FloorplanVectoriser.Conversion
             return new ExtractionResult
             {
                 Rooms = results,
-                UncoveredSegmentIndices = uncoveredIndices
+                UncoveredSegmentIndices = uncoveredIndices,
+                Intersections = intersections,
+                SplitSegments = segments
             };
         }
 
@@ -496,6 +528,167 @@ namespace FloorplanVectoriser.Conversion
             {
                 Debug.LogWarning($"[RoomOutlineExtractor] Failed to write debug file: {ex.Message}");
             }
+        }
+
+        // ── Intersection detection & segment splitting ──
+
+        /// <summary>
+        /// Find all points where two wall segments cross each other mid-segment.
+        /// Uses the existing SegmentsIntersect2D helper. Results are stored in a
+        /// dedicated list, separate from endpoint-based junctions.
+        /// Intersections that fall within <paramref name="tolerance"/> of any
+        /// existing segment endpoint are ignored (they'd just duplicate a spline point).
+        /// </summary>
+        public static List<IntersectionPoint> FindIntersections(
+            List<WallChainBuilder.WallSegment> segments, float tolerance = 0.25f)
+        {
+            var intersections = new List<IntersectionPoint>();
+            float tolSq = tolerance * tolerance;
+
+            // Collect all segment endpoints for proximity checking
+            var endpoints = new List<Vector3>(segments.Count * 2);
+            for (int i = 0; i < segments.Count; i++)
+            {
+                endpoints.Add(segments[i].Start);
+                endpoints.Add(segments[i].End);
+            }
+
+            for (int i = 0; i < segments.Count; i++)
+            {
+                for (int j = i + 1; j < segments.Count; j++)
+                {
+                    if (!SegmentsIntersect2D(
+                            segments[i].Start, segments[i].End,
+                            segments[j].Start, segments[j].End,
+                            out float tA, out float tB))
+                        continue;
+
+                    Vector3 pos = new Vector3(
+                        Mathf.Lerp(segments[i].Start.x, segments[i].End.x, tA),
+                        0f,
+                        Mathf.Lerp(segments[i].Start.z, segments[i].End.z, tA));
+
+                    // Skip if too close to any existing endpoint (would duplicate a spline point)
+                    bool tooClose = false;
+                    for (int ep = 0; ep < endpoints.Count; ep++)
+                    {
+                        float dx = pos.x - endpoints[ep].x;
+                        float dz = pos.z - endpoints[ep].z;
+                        if (dx * dx + dz * dz < tolSq)
+                        {
+                            tooClose = true;
+                            break;
+                        }
+                    }
+                    if (tooClose) continue;
+
+                    intersections.Add(new IntersectionPoint
+                    {
+                        Position = pos,
+                        SegmentA = i,
+                        SegmentB = j,
+                        tA = tA,
+                        tB = tB
+                    });
+                }
+            }
+
+            return intersections;
+        }
+
+        /// <summary>
+        /// Split segments at their intersection points, producing a new expanded
+        /// segment list. Each crossing splits the affected segment into two
+        /// sub-segments at the intersection position, preserving thickness.
+        /// The original segment list is not modified.
+        /// </summary>
+        static List<WallChainBuilder.WallSegment> SplitSegmentsAtIntersections(
+            List<WallChainBuilder.WallSegment> segments,
+            List<IntersectionPoint> intersections)
+        {
+            if (intersections.Count == 0)
+                return new List<WallChainBuilder.WallSegment>(segments);
+
+            // Collect all splits per segment: segIndex → list of (t, position)
+            var splitsPerSegment = new Dictionary<int, List<(float t, Vector3 pos)>>();
+
+            foreach (var ix in intersections)
+            {
+                if (!splitsPerSegment.ContainsKey(ix.SegmentA))
+                    splitsPerSegment[ix.SegmentA] = new List<(float, Vector3)>();
+                splitsPerSegment[ix.SegmentA].Add((ix.tA, ix.Position));
+
+                if (!splitsPerSegment.ContainsKey(ix.SegmentB))
+                    splitsPerSegment[ix.SegmentB] = new List<(float, Vector3)>();
+                splitsPerSegment[ix.SegmentB].Add((ix.tB, ix.Position));
+            }
+
+            var result = new List<WallChainBuilder.WallSegment>();
+
+            for (int s = 0; s < segments.Count; s++)
+            {
+                if (!splitsPerSegment.TryGetValue(s, out var splits))
+                {
+                    // No intersections on this segment — keep as-is
+                    result.Add(segments[s]);
+                    continue;
+                }
+
+                // Sort splits by parametric t so we walk along the segment in order
+                splits.Sort((a, b) => a.t.CompareTo(b.t));
+
+                Vector3 current = segments[s].Start;
+                float thickness = segments[s].Thickness;
+
+                foreach (var (t, pos) in splits)
+                {
+                    result.Add(new WallChainBuilder.WallSegment
+                    {
+                        Start = current,
+                        End = pos,
+                        Thickness = thickness
+                    });
+                    current = pos;
+                }
+
+                // Final sub-segment from last split to original end
+                result.Add(new WallChainBuilder.WallSegment
+                {
+                    Start = current,
+                    End = segments[s].End,
+                    Thickness = thickness
+                });
+            }
+
+            Debug.Log($"[RoomOutlineExtractor] Found {intersections.Count} intersection(s), " +
+                      $"split {segments.Count} segments into {result.Count}");
+
+            return result;
+        }
+
+        // ── Segment intersection helper ──
+
+        /// <summary>
+        /// Test if two line segments intersect in the XZ plane.
+        /// Returns parametric t values for each segment at the intersection.
+        /// </summary>
+        static bool SegmentsIntersect2D(
+            Vector3 p1, Vector3 p2, Vector3 p3, Vector3 p4,
+            out float t1, out float t2)
+        {
+            float d1x = p2.x - p1.x, d1z = p2.z - p1.z;
+            float d2x = p4.x - p3.x, d2z = p4.z - p3.z;
+            float denom = d1x * d2z - d1z * d2x;
+
+            t1 = t2 = 0f;
+            if (Mathf.Abs(denom) < 1e-8f) return false; // parallel
+
+            float ox = p3.x - p1.x, oz = p3.z - p1.z;
+            t1 = (ox * d2z - oz * d2x) / denom;
+            t2 = (ox * d1z - oz * d1x) / denom;
+
+            const float eps = 0.001f;
+            return t1 > eps && t1 < 1f - eps && t2 > eps && t2 < 1f - eps;
         }
 
         // ── Geometry ──
