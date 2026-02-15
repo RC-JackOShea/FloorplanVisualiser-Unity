@@ -78,9 +78,10 @@ namespace FloorplanVectoriser.Conversion
         }
 
         /// <summary>
-        /// Core logic: graph-based room extraction for closed rooms,
-        /// then greedy chaining for any uncovered wall segments.
-        /// Also recovers dead-end connections that were stripped from room outlines.
+        /// Core logic: uses the planar graph extraction to get junctions and connections,
+        /// then builds chains directly from connections — each connection emitted exactly once.
+        /// The outer boundary becomes one connected closed spline; every internal connection
+        /// becomes an individual open spline segment.
         /// </summary>
         static List<ChainResult> BuildChainsWithMetadata(
             List<WallSegment> segments, float connectionThreshold)
@@ -89,81 +90,38 @@ namespace FloorplanVectoriser.Conversion
 
             var results = new List<ChainResult>();
 
-            // Add closed room outlines from graph extraction
-            foreach (var room in extraction.Rooms)
-            {
-                results.Add(new ChainResult
-                {
-                    Points = room.Points,
-                    Thickness = room.Thickness,
-                    IsExterior = room.IsExterior,
-                    IsClosed = true
-                });
-            }
-
-            // Second pass: chain any uncovered segments (dead ends, partial walls, etc.)
-            if (extraction.UncoveredSegmentIndices.Count > 0)
-            {
-                var uncoveredSegments = new List<WallSegment>(extraction.UncoveredSegmentIndices.Count);
-                foreach (int idx in extraction.UncoveredSegmentIndices)
-                    uncoveredSegments.Add(extraction.SplitSegments[idx]);
-
-                var extraChains = GreedyBuildChains(uncoveredSegments, connectionThreshold);
-
-                // Mark these as open chains (they didn't form closed rooms)
-                foreach (var chain in extraChains)
-                {
-                    var openChain = chain;
-                    openChain.IsClosed = false;
-                    results.Add(openChain);
-                }
-
-                Debug.Log($"[WallChainBuilder] Graph extraction: {extraction.Rooms.Count} rooms + " +
-                          $"{extraChains.Count} open wall chains from {extraction.UncoveredSegmentIndices.Count} " +
-                          $"uncovered segments (total {segments.Count} wall segments)");
-            }
-            else
-            {
-                Debug.Log($"[WallChainBuilder] Graph extraction: {extraction.Rooms.Count} rooms, " +
-                          $"all {segments.Count} wall segments covered");
-            }
-
-            // Third pass: recover dead-end connections that were stripped from room outlines.
-            // These are real wall segments (shown as green in debug) that got removed by
-            // stub stripping because they form dead-end excursions in the planar graph faces.
-            // Build a set of all junction edges covered by room outline point sequences,
-            // then emit any uncovered connections as open wall chains.
-            var coveredEdges = new HashSet<long>();
-            var junctionPositions = new Dictionary<int, Vector3>();
+            // Build junction position lookup
+            var junctionPos = new Dictionary<int, Vector3>();
             foreach (var j in extraction.Junctions)
-                junctionPositions[j.Id] = j.Position;
+                junctionPos[j.Id] = j.Position;
 
-            foreach (var room in extraction.Rooms)
+            // Build connection lookup by ID
+            var connectionById = new Dictionary<int, RoomOutlineExtractor.Connection>();
+            foreach (var conn in extraction.Connections)
+                connectionById[conn.Id] = conn;
+
+            // 1. Outer boundary: walk connections in order to build one connected closed spline
+            if (extraction.OuterBoundaryConnectionIds.Count > 0)
             {
-                var pts = room.Points;
-                for (int i = 0; i < pts.Count; i++)
+                var outerChain = BuildOrderedOuterBoundary(
+                    extraction.OuterBoundaryConnectionIds, connectionById, junctionPos);
+
+                if (outerChain.Points != null && outerChain.Points.Count >= 3)
                 {
-                    int next = (i + 1) % pts.Count;
-                    // Find which junctions these points correspond to
-                    int jA = FindClosestJunction(pts[i], extraction.Junctions);
-                    int jB = FindClosestJunction(pts[next], extraction.Junctions);
-                    if (jA >= 0 && jB >= 0 && jA != jB)
-                    {
-                        long ek = PackEdgeKey(jA, jB);
-                        coveredEdges.Add(ek);
-                    }
+                    results.Add(outerChain);
+                    Debug.Log($"[WallChainBuilder] Outer boundary: {outerChain.Points.Count} points " +
+                              $"from {extraction.OuterBoundaryConnectionIds.Count} connections");
                 }
             }
 
-            int recoveredCount = 0;
+            // 2. Internal connections: each non-outer connection becomes an individual open chain
+            int internalCount = 0;
             foreach (var conn in extraction.Connections)
             {
-                long ek = PackEdgeKey(conn.JunctionA, conn.JunctionB);
-                if (coveredEdges.Contains(ek)) continue;
+                if (extraction.OuterBoundaryConnectionIds.Contains(conn.Id)) continue;
 
-                // This connection is not covered by any room outline — emit as open chain
-                if (!junctionPositions.TryGetValue(conn.JunctionA, out var posA)) continue;
-                if (!junctionPositions.TryGetValue(conn.JunctionB, out var posB)) continue;
+                if (!junctionPos.TryGetValue(conn.JunctionA, out var posA)) continue;
+                if (!junctionPos.TryGetValue(conn.JunctionB, out var posB)) continue;
 
                 results.Add(new ChainResult
                 {
@@ -172,129 +130,97 @@ namespace FloorplanVectoriser.Conversion
                     IsExterior = false,
                     IsClosed = false
                 });
-                recoveredCount++;
+                internalCount++;
             }
 
-            if (recoveredCount > 0)
-            {
-                Debug.Log($"[WallChainBuilder] Recovered {recoveredCount} dead-end wall segment(s) " +
-                          $"stripped from room outlines");
-            }
+            Debug.Log($"[WallChainBuilder] Connection-based chains: 1 outer boundary + " +
+                      $"{internalCount} internal walls = {results.Count} total " +
+                      $"(from {extraction.Connections.Count} connections)");
 
             return results;
-        }
-
-        static long PackEdgeKey(int a, int b)
-        {
-            int lo = System.Math.Min(a, b);
-            int hi = System.Math.Max(a, b);
-            return ((long)lo << 32) | (uint)hi;
-        }
-
-        static int FindClosestJunction(Vector3 point, List<RoomOutlineExtractor.JunctionPoint> junctions)
-        {
-            int best = -1;
-            float bestDist = 0.01f; // within 1cm
-            for (int i = 0; i < junctions.Count; i++)
-            {
-                float dist = Vector3.Distance(point, junctions[i].Position);
-                if (dist < bestDist)
-                {
-                    bestDist = dist;
-                    best = junctions[i].Id;
-                }
-            }
-            return best;
         }
 
         /// <summary>
-        /// Original greedy chain-building algorithm as fallback.
+        /// Walk outer boundary connections in order to produce a single connected closed chain.
+        /// Builds a local adjacency from just the outer connections, then walks junction-to-junction.
         /// </summary>
-        static List<ChainResult> GreedyBuildChains(
-            List<WallSegment> segments, float connectionThreshold)
+        static ChainResult BuildOrderedOuterBoundary(
+            HashSet<int> outerConnIds,
+            Dictionary<int, RoomOutlineExtractor.Connection> connectionById,
+            Dictionary<int, Vector3> junctionPos)
         {
-            int n = segments.Count;
-            var used = new bool[n];
-            var results = new List<ChainResult>();
+            // Build adjacency for outer boundary junctions only
+            var outerAdj = new Dictionary<int, List<int>>();
+            float totalThickness = 0f;
+            int thicknessCount = 0;
 
-            for (int seed = 0; seed < n; seed++)
+            foreach (int connId in outerConnIds)
             {
-                if (used[seed]) continue;
-                used[seed] = true;
+                if (!connectionById.TryGetValue(connId, out var conn)) continue;
 
-                var chain = new List<Vector3> { segments[seed].Start, segments[seed].End };
-                float avgThickness = segments[seed].Thickness;
-                int thicknessCount = 1;
+                if (!outerAdj.ContainsKey(conn.JunctionA))
+                    outerAdj[conn.JunctionA] = new List<int>();
+                if (!outerAdj.ContainsKey(conn.JunctionB))
+                    outerAdj[conn.JunctionB] = new List<int>();
 
-                // Extend forward
-                bool extended = true;
-                while (extended)
-                {
-                    extended = false;
-                    Vector3 tip = chain[chain.Count - 1];
-                    int bestIdx = -1;
-                    float bestDist = connectionThreshold;
-                    bool connectAtStart = true;
+                outerAdj[conn.JunctionA].Add(conn.JunctionB);
+                outerAdj[conn.JunctionB].Add(conn.JunctionA);
 
-                    for (int j = 0; j < n; j++)
-                    {
-                        if (used[j]) continue;
-                        float dStart = Vector3.Distance(tip, segments[j].Start);
-                        float dEnd = Vector3.Distance(tip, segments[j].End);
-
-                        if (dStart < bestDist) { bestDist = dStart; bestIdx = j; connectAtStart = true; }
-                        if (dEnd < bestDist) { bestDist = dEnd; bestIdx = j; connectAtStart = false; }
-                    }
-
-                    if (bestIdx >= 0)
-                    {
-                        used[bestIdx] = true;
-                        extended = true;
-                        avgThickness += segments[bestIdx].Thickness;
-                        thicknessCount++;
-                        chain.Add(connectAtStart ? segments[bestIdx].End : segments[bestIdx].Start);
-                    }
-                }
-
-                // Extend backward
-                extended = true;
-                while (extended)
-                {
-                    extended = false;
-                    Vector3 tip = chain[0];
-                    int bestIdx = -1;
-                    float bestDist = connectionThreshold;
-                    bool connectAtEnd = true;
-
-                    for (int j = 0; j < n; j++)
-                    {
-                        if (used[j]) continue;
-                        float dStart = Vector3.Distance(tip, segments[j].Start);
-                        float dEnd = Vector3.Distance(tip, segments[j].End);
-
-                        if (dEnd < bestDist) { bestDist = dEnd; bestIdx = j; connectAtEnd = true; }
-                        if (dStart < bestDist) { bestDist = dStart; bestIdx = j; connectAtEnd = false; }
-                    }
-
-                    if (bestIdx >= 0)
-                    {
-                        used[bestIdx] = true;
-                        extended = true;
-                        avgThickness += segments[bestIdx].Thickness;
-                        thicknessCount++;
-                        chain.Insert(0, connectAtEnd ? segments[bestIdx].Start : segments[bestIdx].End);
-                    }
-                }
-
-                results.Add(new ChainResult
-                {
-                    Points = chain,
-                    Thickness = avgThickness / thicknessCount,
-                    IsExterior = false
-                });
+                totalThickness += conn.Thickness;
+                thicknessCount++;
             }
 
-            return results;
+            float avgThickness = thicknessCount > 0 ? totalThickness / thicknessCount : 0.1f;
+
+            if (outerAdj.Count == 0)
+            {
+                return new ChainResult
+                {
+                    Points = new List<Vector3>(),
+                    Thickness = avgThickness,
+                    IsExterior = true,
+                    IsClosed = true
+                };
+            }
+
+            // Walk the boundary: pick a starting junction, follow unvisited neighbors
+            var visited = new HashSet<int>();
+            var chain = new List<Vector3>();
+
+            // Start from any junction in the outer boundary
+            int current = -1;
+            foreach (int jId in outerAdj.Keys) { current = jId; break; }
+
+            int safety = outerAdj.Count + 2;
+            while (current >= 0 && safety-- > 0)
+            {
+                visited.Add(current);
+                if (junctionPos.TryGetValue(current, out var pos))
+                    chain.Add(pos);
+
+                // Find unvisited neighbor
+                int next = -1;
+                if (outerAdj.TryGetValue(current, out var neighbors))
+                {
+                    foreach (int n in neighbors)
+                    {
+                        if (!visited.Contains(n))
+                        {
+                            next = n;
+                            break;
+                        }
+                    }
+                }
+                current = next;
+            }
+
+            return new ChainResult
+            {
+                Points = chain,
+                Thickness = avgThickness,
+                IsExterior = true,
+                IsClosed = true
+            };
         }
 
         /// <summary>
@@ -303,15 +229,17 @@ namespace FloorplanVectoriser.Conversion
         /// </summary>
         public static WallSegment ExtractCenterline(PolygonEntry wall, Vector2 captureSize)
         {
-            // Convert normalized [0,1] to metres.
+            // Convert normalized [0,1] to metres, centered around origin.
             // X → X, Y (normalized) → Z (world), Y (world) = 0.
+            float halfW = captureSize.x * 0.5f;
+            float halfH = captureSize.y * 0.5f;
             Vector3[] pts = new Vector3[4];
             for (int i = 0; i < 4; i++)
             {
                 pts[i] = new Vector3(
-                    wall.Vertices[i].x * captureSize.x,
+                    wall.Vertices[i].x * captureSize.x - halfW,
                     0f,
-                    (1f - wall.Vertices[i].y) * captureSize.y
+                    (1f - wall.Vertices[i].y) * captureSize.y - halfH
                 );
             }
 

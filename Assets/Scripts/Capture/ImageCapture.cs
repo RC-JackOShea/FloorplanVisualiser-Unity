@@ -407,9 +407,8 @@ namespace FloorplanVectoriser.Capture
                 CreatePreviewPlane();
             }
 
-            // Position at center of the orthographic camera view
-            float center = worldScale / 2f;
-            _previewPlane.transform.position = new Vector3(center, 0f, center);
+            // Position at world origin (visualization is centered around zero)
+            _previewPlane.transform.position = Vector3.zero;
             _previewPlane.transform.rotation = Quaternion.Euler(90f, 0f, 0f); // Flat on ground facing up
             
             // Initial scale - will be updated when camera/image aspect ratio is known
@@ -456,10 +455,8 @@ namespace FloorplanVectoriser.Capture
                 width = _currentWorldScale * aspectRatio;
             }
 
-            // Re-center the plane with new dimensions
-            float centerX = _currentWorldScale / 2f;
-            float centerZ = _currentWorldScale / 2f;
-            _previewPlane.transform.position = new Vector3(centerX, 0f, centerZ);
+            // Center at world origin
+            _previewPlane.transform.position = Vector3.zero;
             _previewPlane.transform.localScale = new Vector3(width, height, 1f);
 
             Debug.Log($"ImageCapture: Preview plane adjusted to {width:F2}x{height:F2} (aspect ratio: {aspectRatio:F2})");

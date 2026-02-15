@@ -50,6 +50,8 @@ namespace FloorplanVectoriser.App
         [Header("Sketch Export")]
         [Tooltip("Photo capture size in metres — maps normalized [0,1] coordinates to world scale")]
         [SerializeField] private Vector2 photoCaptureSize = new Vector2(7f, 7f);
+        [Tooltip("Scale factor applied to all sketch positions/thicknesses before export (e.g. 2.0 = double size)")]
+        [SerializeField] private float sketchScale = 1f;
 
         [Header("Debug Visualisation")]
         [SerializeField] private bool showDebugPoints = true;
@@ -258,7 +260,7 @@ namespace FloorplanVectoriser.App
                       $"{CountByCategory(result, StructureCategory.Window)} windows");
 
             // Convert to sketch format — this is now the single source of truth
-            _lastSketch = SketchConverter.Convert(result, photoCaptureSize);
+            _lastSketch = SketchConverter.Convert(result, photoCaptureSize, sketchScale);
             _lastSketchJson = SketchSerializer.SerializeJson(_lastSketch);
             Debug.Log($"Sketch JSON ({_lastSketch.entities.Count} entities):\n{_lastSketchJson}");
 
@@ -286,14 +288,16 @@ namespace FloorplanVectoriser.App
                     }
                     else
                     {
-                        // Compute center of the 4-vertex polygon in world space
+                        // Compute center of the 4-vertex polygon in world space (centered around origin)
+                        float halfW = photoCaptureSize.x * 0.5f;
+                        float halfH = photoCaptureSize.y * 0.5f;
                         Vector3 center = Vector3.zero;
                         for (int i = 0; i < poly.Vertices.Length; i++)
                         {
                             center += new Vector3(
-                                poly.Vertices[i].x * photoCaptureSize.x,
+                                poly.Vertices[i].x * photoCaptureSize.x - halfW,
                                 0f,
-                                (1f - poly.Vertices[i].y) * photoCaptureSize.y);
+                                (1f - poly.Vertices[i].y) * photoCaptureSize.y - halfH);
                         }
                         center /= poly.Vertices.Length;
 

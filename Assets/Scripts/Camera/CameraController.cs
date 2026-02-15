@@ -55,9 +55,8 @@ namespace FloorplanVectoriser.CameraSystem
             _cam.nearClipPlane = 0.1f;
             _cam.farClipPlane = 100f;
 
-            // Position above center, looking down
-            float halfSize = orthoSize;
-            transform.position = new Vector3(halfSize, 20f, halfSize);
+            // Position above world origin, looking down
+            transform.position = new Vector3(0f, 20f, 0f);
             transform.rotation = Quaternion.Euler(90f, 0f, 0f);
 
             _isOrbiting = false;
@@ -76,24 +75,24 @@ namespace FloorplanVectoriser.CameraSystem
 
         IEnumerator TransitionCoroutine(Vector3 center, Bounds bounds, Action onComplete)
         {
-            _orbitTarget = center;
+            _orbitTarget = Vector3.zero;
             _orbitDistance = bounds.extents.magnitude * 2.5f;
             _targetOrbitDistance = _orbitDistance;
             _currentYaw = 45f; // Start at a nice angle
             _currentPitch = orbitElevation; // Start at the default elevation
 
-            // Calculate destination pose
+            // Calculate destination pose (orbit around world origin)
             Vector3 orbitOffset = Quaternion.Euler(_currentPitch, _currentYaw, 0f) *
                                   new Vector3(0f, 0f, -_orbitDistance);
-            Vector3 endPos = center + orbitOffset;
-            Quaternion endRot = Quaternion.LookRotation(center - endPos);
+            Vector3 endPos = _orbitTarget + orbitOffset;
+            Quaternion endRot = Quaternion.LookRotation(_orbitTarget - endPos);
 
             Vector3 startPos = transform.position;
             Quaternion startRot = transform.rotation;
 
             // Calculate a perspective FOV that matches the current orthographic view
             float startOrthoSize = _cam.orthographicSize;
-            float distanceToCenter = Vector3.Distance(startPos, center);
+            float distanceToCenter = Vector3.Distance(startPos, _orbitTarget);
             float startFOV = 2f * Mathf.Atan(startOrthoSize / distanceToCenter) * Mathf.Rad2Deg;
 
             // Switch to perspective immediately before the lerp begins

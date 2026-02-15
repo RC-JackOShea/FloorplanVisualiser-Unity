@@ -19,8 +19,9 @@ namespace FloorplanVectoriser.Conversion
         /// </summary>
         /// <param name="result">Post-processing result with normalized polygons.</param>
         /// <param name="captureSize">Photo capture size in metres (e.g., 7x7).</param>
+        /// <param name="scale">Uniform scale factor applied to all positions and thicknesses (default 1).</param>
         /// <param name="displayName">Display name for the sketch file.</param>
-        public static SketchFile Convert(PolygonResult result, Vector2 captureSize, string displayName = "Floor Plan")
+        public static SketchFile Convert(PolygonResult result, Vector2 captureSize, float scale = 1f, string displayName = "Floor Plan")
         {
             // Separate polygons by category
             var walls = new List<PolygonEntry>();
@@ -40,13 +41,32 @@ namespace FloorplanVectoriser.Conversion
             // Build wall chains using graph-based room extraction + uncovered segment recovery
             var chainResults = WallChainBuilder.BuildChainsWithMetadata(walls, captureSize, ConnectionThreshold);
 
+            // Apply scale factor to all chain points and thicknesses
+            if (scale != 1f)
+            {
+                for (int i = 0; i < chainResults.Count; i++)
+                {
+                    var cr = chainResults[i];
+                    var scaledPoints = new List<Vector3>(cr.Points.Count);
+                    foreach (var p in cr.Points)
+                        scaledPoints.Add(p * scale);
+                    chainResults[i] = new WallChainBuilder.ChainResult
+                    {
+                        Points = scaledPoints,
+                        Thickness = cr.Thickness * scale,
+                        IsExterior = cr.IsExterior,
+                        IsClosed = cr.IsClosed
+                    };
+                }
+            }
+
             string sketchGuid = Guid.NewGuid().ToString();
             var sketch = new SketchFile
             {
                 displayName = displayName,
                 guid = sketchGuid,
                 fileName = $"{displayName}_{sketchGuid}.sketch",
-                photoCaptureSize = new Vec2(captureSize.x, captureSize.y)
+                photoCaptureSize = new Vec2(captureSize.x * scale, captureSize.y * scale)
             };
 
             int nextEntityId = 1;
@@ -135,8 +155,8 @@ namespace FloorplanVectoriser.Conversion
                 });
             }
 
-            PlaceStructuralProps(doors, StructureCategory.Door, captureSize, splineEntities, sketch, ref nextEntityId);
-            PlaceStructuralProps(windows, StructureCategory.Window, captureSize, splineEntities, sketch, ref nextEntityId);
+            PlaceStructuralProps(doors, StructureCategory.Door, captureSize, scale, splineEntities, sketch, ref nextEntityId);
+            PlaceStructuralProps(windows, StructureCategory.Window, captureSize, scale, splineEntities, sketch, ref nextEntityId);
 
             sketch.maxUsedEntityId = nextEntityId - 1;
             return sketch;
@@ -192,21 +212,23 @@ namespace FloorplanVectoriser.Conversion
 
         static void PlaceStructuralProps(
             List<PolygonEntry> props, StructureCategory category,
-            Vector2 captureSize, List<(int entityId, List<Vector3> chain, bool isClosed)> splineEntities,
+            Vector2 captureSize, float scale, List<(int entityId, List<Vector3> chain, bool isClosed)> splineEntities,
             SketchFile sketch, ref int nextEntityId)
         {
             string label = category == StructureCategory.Door ? "Door" : "Window";
 
             foreach (var prop in props)
             {
-                // Compute center position in metres
+                // Compute center position in metres, centered around origin, applying scale
+                float halfW = captureSize.x * scale * 0.5f;
+                float halfH = captureSize.y * scale * 0.5f;
                 Vector3 center = Vector3.zero;
                 for (int i = 0; i < 4; i++)
                 {
                     center += new Vector3(
-                        prop.Vertices[i].x * captureSize.x,
+                        prop.Vertices[i].x * captureSize.x * scale - halfW,
                         0f,
-                        (1f - prop.Vertices[i].y) * captureSize.y
+                        (1f - prop.Vertices[i].y) * captureSize.y * scale - halfH
                     );
                 }
                 center /= 4f;
