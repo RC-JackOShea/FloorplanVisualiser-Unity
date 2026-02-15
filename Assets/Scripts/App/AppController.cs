@@ -275,8 +275,34 @@ namespace FloorplanVectoriser.App
             {
                 // Extract wall centerline segments (same as the conversion pipeline does)
                 var walls = new System.Collections.Generic.List<PolygonEntry>();
+                var doorPositions = new System.Collections.Generic.List<Vector3>();
+                var windowPositions = new System.Collections.Generic.List<Vector3>();
+
                 foreach (var poly in result.Polygons)
-                    if (poly.Category == StructureCategory.Wall) walls.Add(poly);
+                {
+                    if (poly.Category == StructureCategory.Wall)
+                    {
+                        walls.Add(poly);
+                    }
+                    else
+                    {
+                        // Compute center of the 4-vertex polygon in world space
+                        Vector3 center = Vector3.zero;
+                        for (int i = 0; i < poly.Vertices.Length; i++)
+                        {
+                            center += new Vector3(
+                                poly.Vertices[i].x * photoCaptureSize.x,
+                                0f,
+                                (1f - poly.Vertices[i].y) * photoCaptureSize.y);
+                        }
+                        center /= poly.Vertices.Length;
+
+                        if (poly.Category == StructureCategory.Door)
+                            doorPositions.Add(center);
+                        else if (poly.Category == StructureCategory.Window)
+                            windowPositions.Add(center);
+                    }
+                }
 
                 var wallSegments = new System.Collections.Generic.List<WallChainBuilder.WallSegment>(walls.Count);
                 for (int i = 0; i < walls.Count; i++)
@@ -384,6 +410,48 @@ namespace FloorplanVectoriser.App
 
                     Debug.Log($"[Debug] {extraction.Intersections.Count} intersection points (yellow)");
                 }
+
+                // Door positions (yellow spheres)
+                if (doorPositions.Count > 0)
+                {
+                    var doorMat = new Material(Shader.Find("Universal Render Pipeline/Unlit"));
+                    doorMat.color = Color.yellow;
+
+                    for (int i = 0; i < doorPositions.Count; i++)
+                    {
+                        var sphere = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+                        sphere.name = $"Door[{i}]";
+                        sphere.transform.SetParent(debugRoot.transform);
+                        sphere.transform.localPosition = doorPositions[i];
+                        sphere.transform.localScale = Vector3.one * 0.2f;
+                        sphere.GetComponent<Renderer>().sharedMaterial = doorMat;
+                        Destroy(sphere.GetComponent<Collider>());
+
+                        CreateDebugLabel($"D{i}", doorPositions[i], debugRoot.transform, Color.yellow);
+                    }
+                }
+
+                // Window positions (purple spheres)
+                if (windowPositions.Count > 0)
+                {
+                    var winMat = new Material(Shader.Find("Universal Render Pipeline/Unlit"));
+                    winMat.color = new Color(0.6f, 0f, 0.8f); // purple
+
+                    for (int i = 0; i < windowPositions.Count; i++)
+                    {
+                        var sphere = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+                        sphere.name = $"Window[{i}]";
+                        sphere.transform.SetParent(debugRoot.transform);
+                        sphere.transform.localPosition = windowPositions[i];
+                        sphere.transform.localScale = Vector3.one * 0.2f;
+                        sphere.GetComponent<Renderer>().sharedMaterial = winMat;
+                        Destroy(sphere.GetComponent<Collider>());
+
+                        CreateDebugLabel($"W{i}", windowPositions[i], debugRoot.transform, Color.magenta);
+                    }
+                }
+
+                Debug.Log($"[Debug] {doorPositions.Count} doors (yellow), {windowPositions.Count} windows (purple)");
 
                 debugRoot.transform.localScale = new Vector3(scaleX, 1f, scaleZ);
 
