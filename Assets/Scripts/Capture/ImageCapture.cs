@@ -463,6 +463,16 @@ namespace FloorplanVectoriser.Capture
         }
 
         /// <summary>
+        /// Update the world scale and re-adjust the preview plane to match.
+        /// Called when the user applies a wall measurement to rescale the scene.
+        /// </summary>
+        public void UpdateWorldScale(float newWorldScale)
+        {
+            _currentWorldScale = newWorldScale;
+            UpdatePreviewPlaneAspectRatio();
+        }
+
+        /// <summary>
         /// Hide the 3D preview plane (e.g., when transitioning to mesh viewing).
         /// </summary>
         public void HidePreviewPlane()

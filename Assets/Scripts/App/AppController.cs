@@ -11,6 +11,7 @@ using FloorplanVectoriser.MeshGen;
 using FloorplanVectoriser.PostProcessing;
 using TMPro;
 using UnityEngine;
+using UnityEngine.InputSystem;
 using UnityEngine.UI;
 
 namespace FloorplanVectoriser.App
@@ -80,10 +81,16 @@ namespace FloorplanVectoriser.App
         [SerializeField] private Button saveButton;
 
         [Header("UI - Viewing Toggles")]
+        [SerializeField] private GameObject viewingTogglesUI;
         [SerializeField] private Button outerWallsButton;
         [SerializeField] private Button innerWallsButton;
         [SerializeField] private Button splinePointsButton;
         [SerializeField] private Button doorsWindowsButton;
+
+        [Header("UI - Wall Measurement")]
+        [SerializeField] private GameObject measurementUI;
+        [SerializeField] private TMP_InputField wallLengthInput;
+        [SerializeField] private Button applyMeasurementButton;
 
         AppState _currentState;
         GameObject _generatedMeshRoot;
@@ -100,11 +107,18 @@ namespace FloorplanVectoriser.App
         // Toggle state tracking
         bool _outerWallsVisible = true;
         bool _innerWallsVisible = true;
-        bool _splinePointsVisible = true;
+        bool _splinePointsVisible = false;
         bool _doorsWindowsVisible = true;
 
         static readonly Color ToggleOnColor = new Color(0.2f, 0.8f, 0.2f);
         static readonly Color ToggleOffColor = new Color(0.8f, 0.2f, 0.2f);
+
+        // Wall selection state
+        GameObject _selectedWall;
+        Material _selectedWallOriginalMaterial;
+        Material _highlightMaterial;
+        Vector2 _pointerDownPos;
+        const float TapThreshold = 10f; // pixels
 
         void Start()
         {
@@ -124,6 +138,14 @@ namespace FloorplanVectoriser.App
             if (splinePointsButton != null) splinePointsButton.onClick.AddListener(() => ToggleCategory(ref _splinePointsVisible, _junctionsContainer, splinePointsButton));
             if (doorsWindowsButton != null) doorsWindowsButton.onClick.AddListener(() => ToggleCategory(ref _doorsWindowsVisible, _doorsWindowsContainer, doorsWindowsButton));
 
+            // Wall measurement
+            if (applyMeasurementButton != null) applyMeasurementButton.onClick.AddListener(OnApplyMeasurement);
+            SetActive(measurementUI, false);
+
+            // Highlight material (created once)
+            _highlightMaterial = new Material(Shader.Find("Universal Render Pipeline/Unlit"));
+            _highlightMaterial.color = new Color(0f, 1f, 1f); // cyan
+
             TransitionTo(AppState.CameraPreview);
         }
 
@@ -137,6 +159,8 @@ namespace FloorplanVectoriser.App
             SetActive(reviewUI, false);
             SetActive(processingUI, false);
             SetActive(viewingUI, false);
+            SetActive(measurementUI, false);
+            DeselectWall();
 
             switch (newState)
             {
@@ -167,7 +191,7 @@ namespace FloorplanVectoriser.App
                     _doorsWindowsContainer = null;
                     _outerWallsVisible = true;
                     _innerWallsVisible = true;
-                    _splinePointsVisible = true;
+                    _splinePointsVisible = false;
                     _doorsWindowsVisible = true;
                     break;
 
@@ -184,6 +208,12 @@ namespace FloorplanVectoriser.App
                 case AppState.CameraTransition:
                     // No UI shown during transition
                     // Preview plane remains visible under the generated mesh
+                    // Hide walls (Y=0) until camera transition completes
+                    if (_generatedMeshRoot != null)
+                    {
+                        var s = _generatedMeshRoot.transform.localScale;
+                        _generatedMeshRoot.transform.localScale = new Vector3(s.x, 0f, s.z);
+                    }
                     break;
 
                 case AppState.Viewing:
@@ -193,6 +223,8 @@ namespace FloorplanVectoriser.App
                     UpdateToggleButtonColor(innerWallsButton, _innerWallsVisible);
                     UpdateToggleButtonColor(splinePointsButton, _splinePointsVisible);
                     UpdateToggleButtonColor(doorsWindowsButton, _doorsWindowsVisible);
+                    // Scale up wall meshes now that camera is in position
+                    StartCoroutine(AnimateMeshScaleUp(null));
                     break;
             }
         }
@@ -252,6 +284,140 @@ namespace FloorplanVectoriser.App
             string path = Path.Combine(sketchesDir, fileName);
             SketchSerializer.WriteSketchFile(path, _lastSketch);
             Debug.Log($"Sketch saved to: {path}");
+        }
+
+        // --- Wall Selection & Measurement ---
+
+        void Update()
+        {
+            if (_currentState != AppState.Viewing) return;
+
+            // Detect tap (not drag) for wall selection using new Input System
+            // Touch input
+            if (Touchscreen.current != null && Touchscreen.current.primaryTouch.press.isPressed)
+            {
+                if (Touchscreen.current.primaryTouch.press.wasPressedThisFrame)
+                    _pointerDownPos = Touchscreen.current.primaryTouch.position.ReadValue();
+
+                if (Touchscreen.current.primaryTouch.press.wasReleasedThisFrame)
+                {
+                    Vector2 pointerUpPos = Touchscreen.current.primaryTouch.position.ReadValue();
+                    float dragDist = Vector2.Distance(_pointerDownPos, pointerUpPos);
+                    if (dragDist < TapThreshold)
+                        TrySelectWall(pointerUpPos);
+                }
+            }
+            // Mouse input
+            else if (Mouse.current != null)
+            {
+                if (Mouse.current.leftButton.wasPressedThisFrame)
+                    _pointerDownPos = Mouse.current.position.ReadValue();
+
+                if (Mouse.current.leftButton.wasReleasedThisFrame)
+                {
+                    Vector2 pointerUpPos = Mouse.current.position.ReadValue();
+                    float dragDist = Vector2.Distance(_pointerDownPos, pointerUpPos);
+                    if (dragDist < TapThreshold)
+                        TrySelectWall(pointerUpPos);
+                }
+            }
+        }
+
+        void TrySelectWall(Vector2 screenPos)
+        {
+            var cam = cameraController.GetComponent<Camera>();
+            if (cam == null) return;
+
+            Ray ray = cam.ScreenPointToRay(screenPos);
+            if (Physics.Raycast(ray, out RaycastHit hit))
+            {
+                var info = hit.collider.GetComponent<WallInfo>();
+                if (info != null)
+                {
+                    SelectWall(hit.collider.gameObject);
+                    return;
+                }
+            }
+
+            DeselectWall();
+        }
+
+        void SelectWall(GameObject wall)
+        {
+            // Deselect previous if different
+            if (_selectedWall != null && _selectedWall != wall)
+                DeselectWall();
+
+            if (_selectedWall == wall) return;
+
+            _selectedWall = wall;
+            var renderer = wall.GetComponent<MeshRenderer>();
+            if (renderer != null)
+            {
+                _selectedWallOriginalMaterial = renderer.material;
+                renderer.material = _highlightMaterial;
+            }
+
+            // Hide viewing toggles, show measurement UI
+            SetActive(viewingTogglesUI, false);
+            SetActive(measurementUI, true);
+            if (wallLengthInput != null)
+            {
+                // Pre-fill with current wall length based on existing scale
+                var info = wall.GetComponent<WallInfo>();
+                if (info != null)
+                {
+                    float scaleX = _generatedMeshRoot != null ? _generatedMeshRoot.transform.localScale.x : 1f;
+                    float currentLength = info.LocalLength * scaleX;
+                    wallLengthInput.text = currentLength.ToString("F2");
+                }
+                wallLengthInput.ActivateInputField();
+            }
+        }
+
+        void DeselectWall()
+        {
+            if (_selectedWall != null)
+            {
+                var renderer = _selectedWall.GetComponent<MeshRenderer>();
+                if (renderer != null && _selectedWallOriginalMaterial != null)
+                    renderer.material = _selectedWallOriginalMaterial;
+                _selectedWall = null;
+                _selectedWallOriginalMaterial = null;
+            }
+            SetActive(measurementUI, false);
+            SetActive(viewingTogglesUI, true);
+        }
+
+        void OnApplyMeasurement()
+        {
+            if (_selectedWall == null) return;
+            if (wallLengthInput == null) return;
+            if (!float.TryParse(wallLengthInput.text, out float userLength) || userLength <= 0f) return;
+
+            var info = _selectedWall.GetComponent<WallInfo>();
+            if (info == null) return;
+
+            float localLength = info.LocalLength;
+            if (localLength < 0.001f) return;
+
+            // Compute new worldScale so that this wall's world length equals userLength
+            worldScale = (userLength / localLength) * photoCaptureSize.x;
+
+            float scaleX = worldScale / photoCaptureSize.x;
+            float scaleZ = worldScale / photoCaptureSize.y;
+
+            if (_generatedMeshRoot != null)
+                _generatedMeshRoot.transform.localScale = new Vector3(scaleX, 1f, scaleZ);
+            if (_debugRoot != null)
+                _debugRoot.transform.localScale = new Vector3(scaleX, 1f, scaleZ);
+
+            imageCapture.UpdateWorldScale(worldScale);
+
+            Debug.Log($"[Measurement] Wall local length: {localLength:F3}m, " +
+                      $"user length: {userLength:F2}m, new worldScale: {worldScale:F2}");
+
+            DeselectWall();
         }
 
         // --- Pipeline ---
@@ -363,6 +529,7 @@ namespace FloorplanVectoriser.App
                 // Category containers for toggle visibility
                 var junctionsContainer = new GameObject("Junctions");
                 junctionsContainer.transform.SetParent(debugRoot.transform);
+                junctionsContainer.SetActive(false);
                 _junctionsContainer = junctionsContainer;
 
                 var doorsWindowsContainer = new GameObject("DoorsWindows");
@@ -548,6 +715,10 @@ namespace FloorplanVectoriser.App
                     wallObj.transform.SetParent(outerWallsContainer.transform);
                     wallObj.AddComponent<MeshFilter>().mesh = BuildBoxMesh(bottom, top);
                     wallObj.AddComponent<MeshRenderer>().material = wallMaterial;
+                    wallObj.AddComponent<MeshCollider>();
+                    var outerInfo = wallObj.AddComponent<WallInfo>();
+                    outerInfo.endpointA = posA2;
+                    outerInfo.endpointB = posB2;
                 }
 
                 Debug.Log($"[Mesh] Generated outer wall mesh ({extraction.OuterBoundaryConnectionIds.Count} panels)");
@@ -630,6 +801,10 @@ namespace FloorplanVectoriser.App
                         wallObj.transform.SetParent(innerWallsContainer.transform);
                         wallObj.AddComponent<MeshFilter>().mesh = BuildBoxMesh(bottom, top);
                         wallObj.AddComponent<MeshRenderer>().material = wallMaterial;
+                        wallObj.AddComponent<MeshCollider>();
+                        var innerInfo = wallObj.AddComponent<WallInfo>();
+                        innerInfo.endpointA = start;
+                        innerInfo.endpointB = end;
                         interiorCount++;
                     }
 
@@ -642,7 +817,7 @@ namespace FloorplanVectoriser.App
                 meshRoot.transform.localScale = new Vector3(scaleX, 1f, scaleZ);
             }
 
-            // Transition to viewing
+            // Transition to viewing — TransitionTo will set Y=0 and start the scale-up animation
             TransitionTo(AppState.CameraTransition);
             var viewBounds = _debugRoot != null
                 ? new Bounds(_debugRoot.transform.position, Vector3.one * worldScale)
