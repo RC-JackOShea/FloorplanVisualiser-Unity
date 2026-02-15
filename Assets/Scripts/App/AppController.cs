@@ -9,6 +9,7 @@ using FloorplanVectoriser.Inference;
 using FloorplanVectoriser.Conversion;
 using FloorplanVectoriser.MeshGen;
 using FloorplanVectoriser.PostProcessing;
+using TMPro;
 using UnityEngine;
 using UnityEngine.UI;
 
@@ -78,6 +79,7 @@ namespace FloorplanVectoriser.App
 
         AppState _currentState;
         GameObject _generatedMeshRoot;
+        GameObject _debugRoot;
         SketchFile _lastSketch;
         string _lastSketchJson;
 
@@ -124,6 +126,11 @@ namespace FloorplanVectoriser.App
                     {
                         Destroy(_generatedMeshRoot);
                         _generatedMeshRoot = null;
+                    }
+                    if (_debugRoot != null)
+                    {
+                        Destroy(_debugRoot);
+                        _debugRoot = null;
                     }
                     break;
 
@@ -263,188 +270,149 @@ namespace FloorplanVectoriser.App
             SketchSerializer.WriteSketchFile(autoSavePath, _lastSketch);
             Debug.Log($"Sketch auto-saved to: {autoSavePath}");
 
-            // DEBUG: Visualize wall segment endpoints as spheres
-            // Red = unique endpoint, Green = welded (was within weldTolerance of another)
+            // DEBUG: Visualize junctions, connections, and intersection points
+            // Uses RoomOutlineExtractor as single source of truth (no duplicate union-find)
             {
                 // Extract wall centerline segments (same as the conversion pipeline does)
                 var walls = new System.Collections.Generic.List<PolygonEntry>();
                 foreach (var poly in result.Polygons)
                     if (poly.Category == StructureCategory.Wall) walls.Add(poly);
 
-                // Collect all endpoints and segments
-                var endpoints = new System.Collections.Generic.List<Vector3>(walls.Count * 2);
-                var endpointLabels = new System.Collections.Generic.List<string>(walls.Count * 2);
                 var wallSegments = new System.Collections.Generic.List<WallChainBuilder.WallSegment>(walls.Count);
                 for (int i = 0; i < walls.Count; i++)
-                {
-                    var seg = WallChainBuilder.ExtractCenterline(walls[i], photoCaptureSize);
-                    wallSegments.Add(seg);
-                    endpoints.Add(seg.Start);
-                    endpointLabels.Add($"Seg[{i}]_Start");
-                    endpoints.Add(seg.End);
-                    endpointLabels.Add($"Seg[{i}]_End");
-                }
+                    wallSegments.Add(WallChainBuilder.ExtractCenterline(walls[i], photoCaptureSize));
 
-                // Union-find welding: merge endpoints within weldTolerance
-                int epCount = endpoints.Count;
-                int[] parent = new int[epCount];
-                for (int i = 0; i < epCount; i++) parent[i] = i;
+                // Run extraction — this is now the single source of truth for junctions & connections
+                var extraction = RoomOutlineExtractor.Extract(wallSegments, weldTolerance);
 
-                float weldSq = weldTolerance * weldTolerance;
-                for (int i = 0; i < epCount; i++)
-                {
-                    for (int j = i + 1; j < epCount; j++)
-                    {
-                        float dx = endpoints[i].x - endpoints[j].x;
-                        float dz = endpoints[i].z - endpoints[j].z;
-                        if (dx * dx + dz * dz < weldSq)
-                        {
-                            // Union
-                            int ri = i, rj = j;
-                            while (parent[ri] != ri) ri = parent[ri];
-                            while (parent[rj] != rj) rj = parent[rj];
-                            if (ri != rj) parent[ri] = rj;
-                        }
-                    }
-                }
-
-                // Build clusters: root → list of member indices
-                var clusters = new System.Collections.Generic.Dictionary<int, System.Collections.Generic.List<int>>();
-                for (int i = 0; i < epCount; i++)
-                {
-                    int root = i;
-                    while (parent[root] != root) root = parent[root];
-                    if (!clusters.ContainsKey(root))
-                        clusters[root] = new System.Collections.Generic.List<int>();
-                    clusters[root].Add(i);
-                }
-
-                // Compute welded positions (centroid of each cluster)
-                var weldedPos = new Vector3[epCount];
-                var isWelded = new bool[epCount]; // true if part of a multi-member cluster
-                foreach (var kvp in clusters)
-                {
-                    Vector3 centroid = Vector3.zero;
-                    foreach (int idx in kvp.Value) centroid += endpoints[idx];
-                    centroid /= kvp.Value.Count;
-                    bool multi = kvp.Value.Count > 1;
-                    foreach (int idx in kvp.Value)
-                    {
-                        weldedPos[idx] = centroid;
-                        isWelded[idx] = multi;
-                    }
-                }
-
-                // Create spheres
                 float scaleX = worldScale / photoCaptureSize.x;
                 float scaleZ = worldScale / photoCaptureSize.y;
 
                 var debugRoot = new GameObject("DebugWallEndpoints");
-                _generatedMeshRoot = debugRoot;
+                _debugRoot = debugRoot;
 
-                var redMat = new Material(Shader.Find("Universal Render Pipeline/Unlit"));
-                redMat.color = Color.red;
-                var greenMat = new Material(Shader.Find("Universal Render Pipeline/Unlit"));
-                greenMat.color = Color.green;
-
-                int weldedCount = 0;
-                for (int i = 0; i < epCount; i++)
-                {
-                    bool welded = isWelded[i];
-
-                    // Skip based on toggle settings
-                    if (!showDebugPoints && !welded) continue;
-                    if (!showWeldedPoints && welded) continue;
-
-                    var sphere = GameObject.CreatePrimitive(PrimitiveType.Sphere);
-                    sphere.name = endpointLabels[i];
-                    sphere.transform.SetParent(debugRoot.transform);
-                    sphere.transform.localPosition = weldedPos[i];
-                    sphere.transform.localScale = Vector3.one * 0.25f;
-                    sphere.GetComponent<Renderer>().sharedMaterial = welded ? greenMat : redMat;
-                    Destroy(sphere.GetComponent<Collider>());
-                    if (isWelded[i]) weldedCount++;
-                }
-
-                // Spline points: one per cluster at the welded/solo position (blue)
+                // Junction points (blue spheres with J[n] labels — IDs match extraction data)
                 if (showSplinePoints)
                 {
                     var blueMat = new Material(Shader.Find("Universal Render Pipeline/Unlit"));
                     blueMat.color = Color.blue;
 
-                    int splineIdx = 0;
-                    foreach (var kvp in clusters)
+                    foreach (var junction in extraction.Junctions)
                     {
                         var sphere = GameObject.CreatePrimitive(PrimitiveType.Sphere);
-                        sphere.name = $"Spline[{splineIdx}]";
+                        sphere.name = $"J[{junction.Id}]";
                         sphere.transform.SetParent(debugRoot.transform);
-                        sphere.transform.localPosition = weldedPos[kvp.Value[0]];
+                        sphere.transform.localPosition = junction.Position;
                         sphere.transform.localScale = Vector3.one * 0.25f;
                         sphere.GetComponent<Renderer>().sharedMaterial = blueMat;
                         Destroy(sphere.GetComponent<Collider>());
-                        splineIdx++;
+
+                        CreateDebugLabel($"J{junction.Id}", junction.Position, debugRoot.transform, Color.blue);
                     }
 
-                    Debug.Log($"[Debug] {splineIdx} spline points (blue)");
+                    Debug.Log($"[Debug] {extraction.Junctions.Count} junction points (blue)");
                 }
 
-                // Intersection points: where two segments cross mid-segment (yellow)
-                if (showIntersectionPoints)
+                // Connection lines (blue, buffered away from junction spheres)
                 {
-                    var intersections = RoomOutlineExtractor.FindIntersections(wallSegments, weldTolerance);
-                    if (intersections.Count > 0)
+                    var connMat = new Material(Shader.Find("Universal Render Pipeline/Unlit"));
+                    connMat.color = Color.green;
+
+                    const float buffer = 0.15f; // pull line ends away from junction centres
+
+                    // Build a quick lookup from junction ID to position
+                    var junctionPos = new System.Collections.Generic.Dictionary<int, Vector3>();
+                    foreach (var j in extraction.Junctions)
+                        junctionPos[j.Id] = j.Position;
+
+                    foreach (var conn in extraction.Connections)
                     {
-                        var yellowMat = new Material(Shader.Find("Universal Render Pipeline/Unlit"));
-                        yellowMat.color = Color.yellow;
+                        if (!junctionPos.TryGetValue(conn.JunctionA, out var posA)) continue;
+                        if (!junctionPos.TryGetValue(conn.JunctionB, out var posB)) continue;
 
-                        for (int i = 0; i < intersections.Count; i++)
-                        {
-                            var sphere = GameObject.CreatePrimitive(PrimitiveType.Sphere);
-                            sphere.name = $"Intersection[{i}] (Seg{intersections[i].SegmentA} x Seg{intersections[i].SegmentB})";
-                            sphere.transform.SetParent(debugRoot.transform);
-                            sphere.transform.localPosition = intersections[i].Position;
-                            sphere.transform.localScale = Vector3.one * 0.3f;
-                            sphere.GetComponent<Renderer>().sharedMaterial = yellowMat;
-                            Destroy(sphere.GetComponent<Collider>());
-                        }
+                        // Shorten the line by 'buffer' at each end so it doesn't overlap the spheres
+                        Vector3 dir = (posB - posA).normalized;
+                        Vector3 lineStart = posA + dir * buffer;
+                        Vector3 lineEnd = posB - dir * buffer;
 
-                        Debug.Log($"[Debug] {intersections.Count} intersection points (yellow)");
+                        var lineObj = new GameObject($"C[{conn.Id}] J{conn.JunctionA}-J{conn.JunctionB}");
+                        lineObj.transform.SetParent(debugRoot.transform);
+
+                        var lr = lineObj.AddComponent<LineRenderer>();
+                        lr.useWorldSpace = false;
+                        lr.positionCount = 2;
+                        lr.SetPosition(0, lineStart);
+                        lr.SetPosition(1, lineEnd);
+                        lr.startWidth = 0.06f;
+                        lr.endWidth = 0.06f;
+                        lr.material = connMat;
+
+                        // Label at midpoint
+                        Vector3 mid = (posA + posB) * 0.5f;
+                        CreateDebugLabel($"C{conn.Id}", mid, debugRoot.transform, Color.green, 2f);
                     }
+
+                    Debug.Log($"[Debug] {extraction.Connections.Count} connections (blue lines)");
+                }
+
+                // Intersection points (yellow spheres with IX[n] labels)
+                if (showIntersectionPoints && extraction.Intersections.Count > 0)
+                {
+                    var yellowMat = new Material(Shader.Find("Universal Render Pipeline/Unlit"));
+                    yellowMat.color = Color.yellow;
+
+                    for (int i = 0; i < extraction.Intersections.Count; i++)
+                    {
+                        var ix = extraction.Intersections[i];
+                        var sphere = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+                        sphere.name = $"IX[{i}] (Seg{ix.SegmentA} x Seg{ix.SegmentB})";
+                        sphere.transform.SetParent(debugRoot.transform);
+                        sphere.transform.localPosition = ix.Position;
+                        sphere.transform.localScale = Vector3.one * 0.3f;
+                        sphere.GetComponent<Renderer>().sharedMaterial = yellowMat;
+                        Destroy(sphere.GetComponent<Collider>());
+
+                        CreateDebugLabel($"IX{i}", ix.Position, debugRoot.transform, Color.yellow);
+                    }
+
+                    Debug.Log($"[Debug] {extraction.Intersections.Count} intersection points (yellow)");
                 }
 
                 debugRoot.transform.localScale = new Vector3(scaleX, 1f, scaleZ);
 
-                Debug.Log($"[Debug] {epCount} endpoints, {clusters.Count} unique positions " +
-                          $"({weldedCount} welded, {epCount - weldedCount} solo) " +
+                Debug.Log($"[Debug] {extraction.Junctions.Count} junctions, " +
+                          $"{extraction.Connections.Count} connections, " +
+                          $"{extraction.Intersections.Count} intersections " +
                           $"[weldTolerance={weldTolerance:F3}m]");
-
-                TransitionTo(AppState.Viewing);
             }
 
-            /* COMMENTED OUT: Normal mesh building from sketch data
-            var meshBuilder = new FloorplanMeshBuilder(wallMaterial, doorMaterial, windowMaterial);
+            // Mesh generation disabled — focusing on spline/connection validation
+            // var meshBuilder = new FloorplanMeshBuilder(wallMaterial, doorMaterial, windowMaterial);
+            // StartCoroutine(meshBuilder.BuildFromSketchAsync(_lastSketch, meshesPerFrame, (root, bounds) =>
+            // {
+            //     _generatedMeshRoot = root;
+            //     float scaleX2 = worldScale / photoCaptureSize.x;
+            //     float scaleZ2 = worldScale / photoCaptureSize.y;
+            //     _generatedMeshRoot.transform.localScale = new Vector3(scaleX2, 0f, scaleZ2);
+            //     var worldBounds = new Bounds(
+            //         new Vector3(bounds.center.x * scaleX2, bounds.center.y, bounds.center.z * scaleZ2),
+            //         new Vector3(bounds.size.x * scaleX2, bounds.size.y, bounds.size.z * scaleZ2));
+            //     TransitionTo(AppState.CameraTransition);
+            //     cameraController.LerpToPerspective(worldBounds.center, worldBounds, () =>
+            //     {
+            //         StartCoroutine(AnimateMeshScaleUp(() => TransitionTo(AppState.Viewing)));
+            //     });
+            // }));
 
-            StartCoroutine(meshBuilder.BuildFromSketchAsync(_lastSketch, meshesPerFrame, (root, bounds) =>
+            // Transition directly to viewing with debug points visible
+            TransitionTo(AppState.CameraTransition);
+            var debugBounds = _debugRoot != null
+                ? new Bounds(_debugRoot.transform.position, Vector3.one * worldScale)
+                : new Bounds(Vector3.zero, Vector3.one * worldScale);
+            cameraController.LerpToPerspective(debugBounds.center, debugBounds, () =>
             {
-                _generatedMeshRoot = root;
-
-                float scaleX = worldScale / photoCaptureSize.x;
-                float scaleZ = worldScale / photoCaptureSize.y;
-
-                _generatedMeshRoot.transform.localScale = new Vector3(scaleX, 0f, scaleZ);
-
-                var worldBounds = new Bounds(
-                    new Vector3(bounds.center.x * scaleX, bounds.center.y, bounds.center.z * scaleZ),
-                    new Vector3(bounds.size.x * scaleX, bounds.size.y, bounds.size.z * scaleZ)
-                );
-
-                TransitionTo(AppState.CameraTransition);
-                cameraController.LerpToPerspective(worldBounds.center, worldBounds, () =>
-                {
-                    StartCoroutine(AnimateMeshScaleUp(() => TransitionTo(AppState.Viewing)));
-                });
-            }));
-            */
+                TransitionTo(AppState.Viewing);
+            });
         }
 
         // --- Helpers ---
@@ -484,6 +452,31 @@ namespace FloorplanVectoriser.App
             foreach (var p in result.Polygons)
                 if (p.Category == cat) count++;
             return count;
+        }
+
+        /// <summary>
+        /// Create a world-space TextMeshPro label above a debug sphere.
+        /// The label faces the camera via the BillboardLabel component.
+        /// </summary>
+        static GameObject CreateDebugLabel(string text, Vector3 localPos, Transform parent, Color color, float fontSize = 3f)
+        {
+            var labelObj = new GameObject($"Label_{text}");
+            labelObj.transform.SetParent(parent);
+            labelObj.transform.localPosition = localPos + Vector3.up * 0.25f;
+
+            var tmp = labelObj.AddComponent<TextMeshPro>();
+            tmp.text = text;
+            tmp.fontSize = fontSize;
+            tmp.color = color;
+            tmp.alignment = TextAlignmentOptions.Center;
+            tmp.enableWordWrapping = false;
+
+            var rt = labelObj.GetComponent<RectTransform>();
+            rt.sizeDelta = new Vector2(2f, 1f);
+
+            labelObj.AddComponent<BillboardLabel>();
+
+            return labelObj;
         }
     }
 }

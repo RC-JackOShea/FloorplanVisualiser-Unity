@@ -530,6 +530,11 @@ MonoBehaviour:
   detectionThreshold: 0.5
   mobileThresholdMultiplier: 0.5
   photoCaptureSize: {x: 7, y: 7}
+  showDebugPoints: 0
+  showWeldedPoints: 0
+  showSplinePoints: 1
+  showIntersectionPoints: 0
+  weldTolerance: 0.1
   captureUI: {fileID: 761323275}
   captureButton: {fileID: 858247827}
   galleryButton: {fileID: 1385242282}

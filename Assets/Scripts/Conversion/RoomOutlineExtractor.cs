@@ -28,6 +28,32 @@ namespace FloorplanVectoriser.Conversion
         }
 
         /// <summary>
+        /// A junction node in the planar graph, with a stable ID that matches J[n] labels.
+        /// </summary>
+        public struct JunctionPoint
+        {
+            /// <summary>Stable identifier matching the J[n] debug label.</summary>
+            public int Id;
+            /// <summary>World-space position (Y=0 plane).</summary>
+            public Vector3 Position;
+        }
+
+        /// <summary>
+        /// A connection (edge) between two junction points, representing a wall segment.
+        /// </summary>
+        public struct Connection
+        {
+            /// <summary>Stable identifier matching the C[n] debug label.</summary>
+            public int Id;
+            /// <summary>JunctionPoint.Id of one end.</summary>
+            public int JunctionA;
+            /// <summary>JunctionPoint.Id of the other end.</summary>
+            public int JunctionB;
+            /// <summary>Average wall thickness (metres) along this edge.</summary>
+            public float Thickness;
+        }
+
+        /// <summary>
         /// A point where two wall segments cross each other mid-segment.
         /// Stored separately from endpoint-based junctions.
         /// </summary>
@@ -58,6 +84,10 @@ namespace FloorplanVectoriser.Conversion
             /// <summary>The segment list used for graph building (after intersection splitting).
             /// UncoveredSegmentIndices refers to this list, not the original input.</summary>
             public List<WallChainBuilder.WallSegment> SplitSegments;
+            /// <summary>All junction nodes in the planar graph, with stable IDs matching J[n] labels.</summary>
+            public List<JunctionPoint> Junctions;
+            /// <summary>All connections (edges) between junctions, with stable IDs matching C[n] labels.</summary>
+            public List<Connection> Connections;
         }
 
         /// <summary>
@@ -75,7 +105,9 @@ namespace FloorplanVectoriser.Conversion
                 Rooms = new List<RoomOutline>(),
                 UncoveredSegmentIndices = new List<int>(),
                 Intersections = new List<IntersectionPoint>(),
-                SplitSegments = segments
+                SplitSegments = segments,
+                Junctions = new List<JunctionPoint>(),
+                Connections = new List<Connection>()
             };
 
             if (segments.Count < 3)
@@ -181,8 +213,14 @@ namespace FloorplanVectoriser.Conversion
             //     should share either X or Z. Snap the smaller delta to the average.
             SnapJunctionsToManhattan(junctions, adjacency, junctionCount);
 
+            // 4c. Capture pre-pruning state for debug output
+            var prePruneNeighbors = new List<HashSet<int>>(junctionCount);
+            for (int i = 0; i < junctionCount; i++)
+                prePruneNeighbors.Add(new HashSet<int>(adjacency[i]));
+
             // 5. Prune dead ends (degree-1 vertices) — they can't form rooms
-            PruneDeadEnds(adjacency, junctionCount);
+            var pruneLog = new List<string>();
+            PruneDeadEnds(adjacency, junctionCount, pruneLog);
 
             // 6. Sort neighbors at each vertex by angle in the X-Z plane
             var sortedNeighbors = new List<int>[junctionCount];
@@ -321,24 +359,61 @@ namespace FloorplanVectoriser.Conversion
                 results.Add(outline);
             }
 
-            // Mark outer face
+            // 12. Mark outer face (most negative signed area = unbounded exterior face)
+            //     This only uses real graph edges — no artificial connections.
             if (outerFaceIdx >= 0)
             {
                 var outer = results[outerFaceIdx];
                 outer.IsExterior = true;
                 results[outerFaceIdx] = outer;
+
+                Debug.Log($"[RoomOutlineExtractor] Outer boundary: {outer.Points.Count} points " +
+                          $"(face {outerFaceIdx}, area={mostNegativeArea:F3})");
+            }
+
+            // 13. Build exposed junction and connection lists (pre-pruning, so all walls are visible)
+            var junctionList = new List<JunctionPoint>(junctionCount);
+            for (int i = 0; i < junctionCount; i++)
+            {
+                junctionList.Add(new JunctionPoint { Id = i, Position = junctions[i] });
+            }
+
+            var connectionList = new List<Connection>();
+            var visitedEdges = new HashSet<long>();
+            int connId = 0;
+            for (int v = 0; v < junctionCount; v++)
+            {
+                foreach (int u in prePruneNeighbors[v])
+                {
+                    long ek = EdgeKey(v, u);
+                    if (visitedEdges.Contains(ek)) continue;
+                    visitedEdges.Add(ek);
+
+                    float thickness = edgeThickness.TryGetValue(ek, out float t) ? t : 0.1f;
+                    connectionList.Add(new Connection
+                    {
+                        Id = connId++,
+                        JunctionA = v,
+                        JunctionB = u,
+                        Thickness = thickness
+                    });
+                }
             }
 
             // Debug: dump all pipeline data to a file for analysis
             DumpDebugFile(segments, junctions, junctionCount, adjacency,
-                faces, results, outerFaceIdx, uncoveredIndices, edgesInFaces);
+                faces, results, outerFaceIdx, uncoveredIndices, edgesInFaces,
+                intersections, connectionList,
+                segmentEdgeKeys, epToJunction, prePruneNeighbors, pruneLog);
 
             return new ExtractionResult
             {
                 Rooms = results,
                 UncoveredSegmentIndices = uncoveredIndices,
                 Intersections = intersections,
-                SplitSegments = segments
+                SplitSegments = segments,
+                Junctions = junctionList,
+                Connections = connectionList
             };
         }
 
@@ -363,18 +438,22 @@ namespace FloorplanVectoriser.Conversion
 
         // ── Dead-end pruning ──
 
-        static void PruneDeadEnds(HashSet<int>[] adjacency, int count)
+        static void PruneDeadEnds(HashSet<int>[] adjacency, int count, List<string> log)
         {
             bool changed = true;
+            int pass = 0;
             while (changed)
             {
                 changed = false;
+                pass++;
                 for (int v = 0; v < count; v++)
                 {
                     if (adjacency[v].Count == 1)
                     {
-                        foreach (int neighbor in adjacency[v])
-                            adjacency[neighbor].Remove(v);
+                        int neighbor = -1;
+                        foreach (int n in adjacency[v]) neighbor = n;
+                        log.Add($"Pass {pass}: pruned J[{v}] (was connected to J[{neighbor}])");
+                        adjacency[neighbor].Remove(v);
                         adjacency[v].Clear();
                         changed = true;
                     }
@@ -452,7 +531,13 @@ namespace FloorplanVectoriser.Conversion
             List<RoomOutline> results,
             int outerFaceIdx,
             List<int> uncoveredIndices,
-            HashSet<long> edgesInFaces)
+            HashSet<long> edgesInFaces,
+            List<IntersectionPoint> intersections,
+            List<Connection> connections,
+            long[] segmentEdgeKeys,
+            int[] epToJunction,
+            List<HashSet<int>> prePruneNeighbors,
+            List<string> pruneLog)
         {
             try
             {
@@ -472,8 +557,34 @@ namespace FloorplanVectoriser.Conversion
                 }
                 sb.AppendLine();
 
-                // 2. Junction nodes after clustering + Manhattan snap
-                sb.AppendLine($"--- JUNCTIONS ({junctionCount}) ---");
+                // 1b. Segment-to-junction mapping
+                sb.AppendLine($"--- SEGMENT → JUNCTION MAPPING ({segments.Count}) ---");
+                for (int i = 0; i < segments.Count; i++)
+                {
+                    int jA = epToJunction[2 * i];
+                    int jB = epToJunction[2 * i + 1];
+                    string edgeStr = segmentEdgeKeys[i] < 0 ? "DEGENERATE" : $"J[{jA}] <-> J[{jB}]";
+                    sb.AppendLine($"  Seg[{i}] -> {edgeStr}");
+                }
+                sb.AppendLine();
+
+                // 1c. Pre-pruning adjacency
+                sb.AppendLine($"--- PRE-PRUNING ADJACENCY ({junctionCount}) ---");
+                for (int i = 0; i < junctionCount; i++)
+                {
+                    var pre = prePruneNeighbors[i];
+                    sb.AppendLine($"  J[{i}]: ({junctions[i].x:F3}, {junctions[i].z:F3})  degree={pre.Count}  neighbors=[{string.Join(", ", pre)}]");
+                }
+                sb.AppendLine();
+
+                // 1d. Prune log
+                sb.AppendLine($"--- DEAD-END PRUNING LOG ({pruneLog.Count} removals) ---");
+                foreach (var entry in pruneLog)
+                    sb.AppendLine($"  {entry}");
+                sb.AppendLine();
+
+                // 2. Junction nodes after clustering + Manhattan snap + pruning
+                sb.AppendLine($"--- JUNCTIONS (post-prune) ({junctionCount}) ---");
                 for (int i = 0; i < junctionCount; i++)
                 {
                     var j = junctions[i];
@@ -519,6 +630,25 @@ namespace FloorplanVectoriser.Conversion
                 {
                     var s = segments[idx];
                     sb.AppendLine($"  Seg[{idx}]: ({s.Start.x:F3}, {s.Start.z:F3}) -> ({s.End.x:F3}, {s.End.z:F3})");
+                }
+                sb.AppendLine();
+
+                // 6. Intersection points
+                sb.AppendLine($"--- INTERSECTION POINTS ({intersections.Count}) ---");
+                for (int i = 0; i < intersections.Count; i++)
+                {
+                    var ix = intersections[i];
+                    sb.AppendLine($"  IX[{i}]: ({ix.Position.x:F3}, {ix.Position.z:F3})  " +
+                                  $"SegA={ix.SegmentA} (t={ix.tA:F3})  SegB={ix.SegmentB} (t={ix.tB:F3})");
+                }
+                sb.AppendLine();
+
+                // 7. Connections (edges between junctions)
+                sb.AppendLine($"--- CONNECTIONS ({connections.Count}) ---");
+                for (int i = 0; i < connections.Count; i++)
+                {
+                    var c = connections[i];
+                    sb.AppendLine($"  C[{c.Id}]: J[{c.JunctionA}] <-> J[{c.JunctionB}]  thickness={c.Thickness:F3}");
                 }
 
                 File.WriteAllText(path, sb.ToString());
