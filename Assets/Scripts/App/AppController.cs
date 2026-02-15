@@ -422,8 +422,96 @@ namespace FloorplanVectoriser.App
                     wallObj.AddComponent<MeshRenderer>().material = wallMaterial;
                 }
 
-                meshRoot.transform.localScale = new Vector3(scaleX, 1f, scaleZ);
                 Debug.Log($"[Mesh] Generated outer wall mesh ({extraction.OuterBoundaryConnectionIds.Count} panels)");
+
+                // Generate interior wall meshes from non-outer connections, chaining collinear runs
+                {
+                    // 1. Build interior-only adjacency: junction → list of (neighbor, connectionId)
+                    var interiorAdj = new System.Collections.Generic.Dictionary<int, System.Collections.Generic.List<(int neighbor, int connId)>>();
+                    var interiorConns = new System.Collections.Generic.Dictionary<int, RoomOutlineExtractor.Connection>();
+
+                    foreach (var conn in extraction.Connections)
+                    {
+                        if (extraction.OuterBoundaryConnectionIds.Contains(conn.Id)) continue;
+                        interiorConns[conn.Id] = conn;
+
+                        if (!interiorAdj.ContainsKey(conn.JunctionA))
+                            interiorAdj[conn.JunctionA] = new System.Collections.Generic.List<(int, int)>();
+                        if (!interiorAdj.ContainsKey(conn.JunctionB))
+                            interiorAdj[conn.JunctionB] = new System.Collections.Generic.List<(int, int)>();
+
+                        interiorAdj[conn.JunctionA].Add((conn.JunctionB, conn.Id));
+                        interiorAdj[conn.JunctionB].Add((conn.JunctionA, conn.Id));
+                    }
+
+                    // 2. Walk chains: merge collinear connections through degree-2 interior junctions
+                    var usedConns = new System.Collections.Generic.HashSet<int>();
+                    var chains = new System.Collections.Generic.List<(System.Collections.Generic.List<int> junctions, float thickness)>();
+
+                    foreach (var conn in interiorConns.Values)
+                    {
+                        if (usedConns.Contains(conn.Id)) continue;
+
+                        // Start a chain from this connection
+                        var chain = new System.Collections.Generic.List<int> { conn.JunctionA, conn.JunctionB };
+                        float totalThickness = conn.Thickness;
+                        int thicknessCount = 1;
+                        usedConns.Add(conn.Id);
+
+                        // Determine axis: vertical (same X) or horizontal (same Z)
+                        Vector3 pA = junctionPos[conn.JunctionA];
+                        Vector3 pB = junctionPos[conn.JunctionB];
+                        bool isVertical = Mathf.Abs(pA.x - pB.x) < Mathf.Abs(pA.z - pB.z);
+
+                        // Extend chain forward (from last junction)
+                        ExtendChain(chain, isVertical, junctionPos, interiorAdj, usedConns,
+                            interiorConns, ref totalThickness, ref thicknessCount, forward: true);
+
+                        // Extend chain backward (from first junction)
+                        ExtendChain(chain, isVertical, junctionPos, interiorAdj, usedConns,
+                            interiorConns, ref totalThickness, ref thicknessCount, forward: false);
+
+                        chains.Add((chain, totalThickness / thicknessCount));
+                    }
+
+                    // 3. Generate wall panel per chain
+                    int interiorCount = 0;
+                    foreach (var (chain, avgThickness) in chains)
+                    {
+                        Vector3 start = junctionPos[chain[0]];
+                        Vector3 end = junctionPos[chain[chain.Count - 1]];
+
+                        float halfThick = Mathf.Max(avgThickness * 0.5f, 0.05f);
+                        Vector3 dir = (end - start).normalized;
+                        Vector3 perp = new Vector3(-dir.z, 0f, dir.x);
+
+                        Vector3[] bottom = {
+                            start - perp * halfThick,
+                            start + perp * halfThick,
+                            end + perp * halfThick,
+                            end - perp * halfThick
+                        };
+                        Vector3[] top = new Vector3[4];
+                        for (int i = 0; i < 4; i++)
+                            top[i] = bottom[i] + Vector3.up * extrudeHeight;
+
+                        string label = chain.Count == 2
+                            ? $"InnerWall_J{chain[0]}-J{chain[1]}"
+                            : $"InnerWall_J{chain[0]}-...-J{chain[chain.Count - 1]}({chain.Count}pts)";
+                        var wallObj = new GameObject(label);
+                        wallObj.transform.SetParent(meshRoot.transform);
+                        wallObj.AddComponent<MeshFilter>().mesh = BuildBoxMesh(bottom, top);
+                        wallObj.AddComponent<MeshRenderer>().material = wallMaterial;
+                        interiorCount++;
+                    }
+
+                    Debug.Log($"[Mesh] Generated {interiorCount} interior wall panels " +
+                              $"(from {interiorConns.Count} connections, merged into {chains.Count} chains)");
+                }
+
+                // Apply scale AFTER all children are added, so SetParent doesn't
+                // compensate child local scale to counteract the parent transform
+                meshRoot.transform.localScale = new Vector3(scaleX, 1f, scaleZ);
             }
 
             // Transition to viewing
@@ -466,6 +554,62 @@ namespace FloorplanVectoriser.App
         static void SetActive(GameObject obj, bool active)
         {
             if (obj != null) obj.SetActive(active);
+        }
+
+        /// <summary>
+        /// Extend a junction chain in one direction by following collinear connections
+        /// through degree-2 interior junctions.
+        /// </summary>
+        static void ExtendChain(
+            System.Collections.Generic.List<int> chain,
+            bool isVertical,
+            System.Collections.Generic.Dictionary<int, Vector3> junctionPos,
+            System.Collections.Generic.Dictionary<int, System.Collections.Generic.List<(int neighbor, int connId)>> interiorAdj,
+            System.Collections.Generic.HashSet<int> usedConns,
+            System.Collections.Generic.Dictionary<int, RoomOutlineExtractor.Connection> interiorConns,
+            ref float totalThickness, ref int thicknessCount,
+            bool forward)
+        {
+            while (true)
+            {
+                int tip = forward ? chain[chain.Count - 1] : chain[0];
+                if (!interiorAdj.TryGetValue(tip, out var neighbors)) break;
+
+                // Only extend through junctions with exactly 2 interior neighbors
+                if (neighbors.Count != 2) break;
+
+                // Find the unused neighbor
+                int nextConn = -1;
+                int nextJunction = -1;
+                foreach (var (neighbor, connId) in neighbors)
+                {
+                    if (!usedConns.Contains(connId))
+                    {
+                        nextConn = connId;
+                        nextJunction = neighbor;
+                        break;
+                    }
+                }
+                if (nextConn < 0) break;
+
+                // Check collinearity: the next segment must be on the same axis
+                Vector3 tipPos = junctionPos[tip];
+                Vector3 nextPos = junctionPos[nextJunction];
+                bool nextIsVertical = Mathf.Abs(tipPos.x - nextPos.x) < Mathf.Abs(tipPos.z - nextPos.z);
+                if (nextIsVertical != isVertical) break;
+
+                usedConns.Add(nextConn);
+                if (interiorConns.TryGetValue(nextConn, out var c))
+                {
+                    totalThickness += c.Thickness;
+                    thicknessCount++;
+                }
+
+                if (forward)
+                    chain.Add(nextJunction);
+                else
+                    chain.Insert(0, nextJunction);
+            }
         }
 
         static Mesh BuildBoxMesh(Vector3[] bottom, Vector3[] top)
