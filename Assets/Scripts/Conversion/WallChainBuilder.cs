@@ -80,6 +80,7 @@ namespace FloorplanVectoriser.Conversion
         /// <summary>
         /// Core logic: graph-based room extraction for closed rooms,
         /// then greedy chaining for any uncovered wall segments.
+        /// Also recovers dead-end connections that were stripped from room outlines.
         /// </summary>
         static List<ChainResult> BuildChainsWithMetadata(
             List<WallSegment> segments, float connectionThreshold)
@@ -127,7 +128,83 @@ namespace FloorplanVectoriser.Conversion
                           $"all {segments.Count} wall segments covered");
             }
 
+            // Third pass: recover dead-end connections that were stripped from room outlines.
+            // These are real wall segments (shown as green in debug) that got removed by
+            // stub stripping because they form dead-end excursions in the planar graph faces.
+            // Build a set of all junction edges covered by room outline point sequences,
+            // then emit any uncovered connections as open wall chains.
+            var coveredEdges = new HashSet<long>();
+            var junctionPositions = new Dictionary<int, Vector3>();
+            foreach (var j in extraction.Junctions)
+                junctionPositions[j.Id] = j.Position;
+
+            foreach (var room in extraction.Rooms)
+            {
+                var pts = room.Points;
+                for (int i = 0; i < pts.Count; i++)
+                {
+                    int next = (i + 1) % pts.Count;
+                    // Find which junctions these points correspond to
+                    int jA = FindClosestJunction(pts[i], extraction.Junctions);
+                    int jB = FindClosestJunction(pts[next], extraction.Junctions);
+                    if (jA >= 0 && jB >= 0 && jA != jB)
+                    {
+                        long ek = PackEdgeKey(jA, jB);
+                        coveredEdges.Add(ek);
+                    }
+                }
+            }
+
+            int recoveredCount = 0;
+            foreach (var conn in extraction.Connections)
+            {
+                long ek = PackEdgeKey(conn.JunctionA, conn.JunctionB);
+                if (coveredEdges.Contains(ek)) continue;
+
+                // This connection is not covered by any room outline — emit as open chain
+                if (!junctionPositions.TryGetValue(conn.JunctionA, out var posA)) continue;
+                if (!junctionPositions.TryGetValue(conn.JunctionB, out var posB)) continue;
+
+                results.Add(new ChainResult
+                {
+                    Points = new List<Vector3> { posA, posB },
+                    Thickness = conn.Thickness,
+                    IsExterior = false,
+                    IsClosed = false
+                });
+                recoveredCount++;
+            }
+
+            if (recoveredCount > 0)
+            {
+                Debug.Log($"[WallChainBuilder] Recovered {recoveredCount} dead-end wall segment(s) " +
+                          $"stripped from room outlines");
+            }
+
             return results;
+        }
+
+        static long PackEdgeKey(int a, int b)
+        {
+            int lo = System.Math.Min(a, b);
+            int hi = System.Math.Max(a, b);
+            return ((long)lo << 32) | (uint)hi;
+        }
+
+        static int FindClosestJunction(Vector3 point, List<RoomOutlineExtractor.JunctionPoint> junctions)
+        {
+            int best = -1;
+            float bestDist = 0.01f; // within 1cm
+            for (int i = 0; i < junctions.Count; i++)
+            {
+                float dist = Vector3.Distance(point, junctions[i].Position);
+                if (dist < bestDist)
+                {
+                    bestDist = dist;
+                    best = junctions[i].Id;
+                }
+            }
+            return best;
         }
 
         /// <summary>

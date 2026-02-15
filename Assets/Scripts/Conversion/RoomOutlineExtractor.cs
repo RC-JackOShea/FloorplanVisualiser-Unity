@@ -361,6 +361,46 @@ namespace FloorplanVectoriser.Conversion
                 foreach (int idx in face)
                     outline.Points.Add(junctions[idx]);
 
+                // Strip dead-end stubs: where the path visits a junction, goes out
+                // to a dead-end, and returns (points[i] == points[i+2]).
+                // Repeat until no more stubs remain.
+                bool stripped = true;
+                while (stripped)
+                {
+                    stripped = false;
+                    var pts = outline.Points;
+                    for (int i = 0; i < pts.Count - 2; i++)
+                    {
+                        if (Vector3.Distance(pts[i], pts[i + 2]) < 0.001f)
+                        {
+                            // Remove the spike: point[i+1] (the dead-end) and point[i+2] (the duplicate)
+                            pts.RemoveAt(i + 2);
+                            pts.RemoveAt(i + 1);
+                            stripped = true;
+                            break; // restart scan
+                        }
+                    }
+                    // Also check wrap-around for closed outlines
+                    if (!stripped && pts.Count >= 3)
+                    {
+                        int n = pts.Count;
+                        // Check last-first-second
+                        if (Vector3.Distance(pts[n - 1], pts[1]) < 0.001f)
+                        {
+                            pts.RemoveAt(0);
+                            pts.RemoveAt(pts.Count - 1);
+                            stripped = true;
+                        }
+                        // Check second-to-last, last, first
+                        else if (Vector3.Distance(pts[n - 2], pts[0]) < 0.001f)
+                        {
+                            pts.RemoveAt(n - 1);
+                            pts.RemoveAt(n - 2);
+                            stripped = true;
+                        }
+                    }
+                }
+
                 if (signedArea < mostNegativeArea)
                 {
                     mostNegativeArea = signedArea;

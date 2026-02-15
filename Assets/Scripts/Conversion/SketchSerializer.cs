@@ -7,8 +7,8 @@ namespace FloorplanVectoriser.Conversion
 {
     /// <summary>
     /// Serializes a <see cref="SketchFile"/> to the .sketch format:
-    /// a ZIP archive containing data.json with $id reference tracking
-    /// and the { typeName, typeId, data } component wrapper convention.
+    /// a ZIP archive containing data.json
+    /// with the { typeName, typeId, data } component wrapper convention.
     /// </summary>
     public static class SketchSerializer
     {
@@ -17,9 +17,8 @@ namespace FloorplanVectoriser.Conversion
         /// </summary>
         public static string SerializeJson(SketchFile sketch)
         {
-            var ctx = new IdContext();
             var sb = new StringBuilder(8192);
-            WriteSketchFile(sb, sketch, ctx, 0);
+            WriteSketchFile(sb, sketch, 0);
             return sb.ToString();
         }
 
@@ -51,20 +50,11 @@ namespace FloorplanVectoriser.Conversion
             }
         }
 
-        // ── Incrementing $id tracker ──
-
-        class IdContext
-        {
-            int _next = 1;
-            public string Next() => (_next++).ToString();
-        }
-
         // ── Root ──
 
-        static void WriteSketchFile(StringBuilder sb, SketchFile s, IdContext ctx, int indent)
+        static void WriteSketchFile(StringBuilder sb, SketchFile s, int indent)
         {
             sb.Append("{\n");
-            WriteString(sb, "$id", ctx.Next(), indent + 1); sb.Append(",\n");
             WriteString(sb, "toolVersion", s.toolVersion, indent + 1); sb.Append(",\n");
             WriteString(sb, "appVersion", s.appVersion, indent + 1); sb.Append(",\n");
             WriteString(sb, "unityVersion", s.unityVersion, indent + 1); sb.Append(",\n");
@@ -91,7 +81,7 @@ namespace FloorplanVectoriser.Conversion
             Indent(sb, indent + 1); sb.Append("\"entities\": [\n");
             for (int e = 0; e < s.entities.Count; e++)
             {
-                WriteEntity(sb, s.entities[e], ctx, indent + 2);
+                WriteEntity(sb, s.entities[e], indent + 2);
                 if (e < s.entities.Count - 1) sb.Append(",");
                 sb.Append("\n");
             }
@@ -101,17 +91,16 @@ namespace FloorplanVectoriser.Conversion
 
         // ── Entity ──
 
-        static void WriteEntity(StringBuilder sb, SketchEntity entity, IdContext ctx, int indent)
+        static void WriteEntity(StringBuilder sb, SketchEntity entity, int indent)
         {
             Indent(sb, indent); sb.Append("{\n");
-            WriteString(sb, "$id", ctx.Next(), indent + 1); sb.Append(",\n");
             WriteInt(sb, "id", entity.id, indent + 1); sb.Append(",\n");
             WriteString(sb, "name", entity.name, indent + 1); sb.Append(",\n");
             Indent(sb, indent + 1); sb.Append("\"components\": [\n");
 
             for (int c = 0; c < entity.components.Count; c++)
             {
-                WriteComponentWrapper(sb, entity.components[c], ctx, indent + 2);
+                WriteComponentWrapper(sb, entity.components[c], indent + 2);
                 if (c < entity.components.Count - 1) sb.Append(",");
                 sb.Append("\n");
             }
@@ -120,28 +109,26 @@ namespace FloorplanVectoriser.Conversion
             Indent(sb, indent); sb.Append("}");
         }
 
-        // ── Component wrapper: { typeName, typeId, data: { $id, ...fields } } ──
+        // ── Component wrapper: { typeName, typeId, data: { ...fields } } ──
 
-        static void WriteComponentWrapper(StringBuilder sb, SketchComponent comp, IdContext ctx, int indent)
+        static void WriteComponentWrapper(StringBuilder sb, SketchComponent comp, int indent)
         {
             Indent(sb, indent); sb.Append("{\n");
             WriteString(sb, "typeName", comp.TypeName, indent + 1); sb.Append(",\n");
             WriteString(sb, "typeId", "0", indent + 1); sb.Append(",\n");
             Indent(sb, indent + 1); sb.Append("\"data\": ");
-            WriteComponentData(sb, comp, ctx, indent + 1);
+            WriteComponentData(sb, comp, indent + 1);
             sb.Append("\n");
             Indent(sb, indent); sb.Append("}");
         }
 
-        static void WriteComponentData(StringBuilder sb, SketchComponent comp, IdContext ctx, int indent)
+        static void WriteComponentData(StringBuilder sb, SketchComponent comp, int indent)
         {
             sb.Append("{\n");
-            WriteString(sb, "$id", ctx.Next(), indent + 1);
 
             switch (comp)
             {
                 case SplineComponent s:
-                    sb.Append(",\n");
                     WriteString(sb, "splinePlane", s.splinePlane, indent + 1); sb.Append(",\n");
                     WriteBool(sb, "isClosed", s.isClosed, indent + 1); sb.Append(",\n");
                     WriteBool(sb, "isExternal", s.isExternal, indent + 1); sb.Append(",\n");
@@ -170,37 +157,31 @@ namespace FloorplanVectoriser.Conversion
                     break;
 
                 case SplineRefComponent r:
-                    sb.Append(",\n");
                     WriteInt(sb, "entityId", r.entityId, indent + 1); sb.Append("\n");
                     break;
 
                 case WallComponent w:
-                    sb.Append(",\n");
                     WriteFloat(sb, "outset", w.outset, indent + 1); sb.Append(",\n");
                     WriteFloat(sb, "inset", w.inset, indent + 1); sb.Append(",\n");
                     WriteFloat(sb, "height", w.height, indent + 1); sb.Append("\n");
                     break;
 
                 case SplineOutlineOp o:
-                    sb.Append(",\n");
                     WriteFloat(sb, "inset", o.inset, indent + 1); sb.Append(",\n");
                     WriteFloat(sb, "outset", o.outset, indent + 1); sb.Append("\n");
                     break;
 
                 case SplineExtrudeOp ex:
-                    sb.Append(",\n");
                     WriteVec3(sb, "dir", ex.dir, indent + 1); sb.Append(",\n");
                     WriteFloat(sb, "amount", ex.amount, indent + 1); sb.Append(",\n");
                     WriteBool(sb, "flippedNormals", ex.flippedNormals, indent + 1); sb.Append("\n");
                     break;
 
                 case SplineTesselateOp t:
-                    sb.Append(",\n");
                     WriteBool(sb, "flippedNormals", t.flippedNormals, indent + 1); sb.Append("\n");
                     break;
 
                 case StructuralPropComponent sp:
-                    sb.Append(",\n");
                     WriteString(sb, "guid", sp.guid, indent + 1); sb.Append(",\n");
                     WriteInt(sb, "entityId", sp.entityId, indent + 1); sb.Append(",\n");
                     WriteString(sb, "assetGUID", sp.assetGUID, indent + 1); sb.Append(",\n");

@@ -55,11 +55,9 @@ namespace FloorplanVectoriser.Conversion
             var splineEntities = new List<(int entityId, List<Vector3> chain, bool isClosed)>();
 
             // Create spline + wall entities for each chain
-            // TODO: Currently restricted to exterior-only output for iterating on outer edge.
             for (int c = 0; c < chainResults.Count; c++)
             {
                 var chainResult = chainResults[c];
-                if (!chainResult.IsExterior) continue; // outer edge only for now
                 var chain = chainResult.Points;
                 float thickness = chainResult.Thickness;
                 float halfThickness = Mathf.Max(thickness * 0.5f, 0.05f);
@@ -137,9 +135,8 @@ namespace FloorplanVectoriser.Conversion
                 });
             }
 
-            // TODO: Doors/windows disabled while iterating on outer edge
-            // PlaceStructuralProps(doors, StructureCategory.Door, captureSize, splineEntities, sketch, ref nextEntityId);
-            // PlaceStructuralProps(windows, StructureCategory.Window, captureSize, splineEntities, sketch, ref nextEntityId);
+            PlaceStructuralProps(doors, StructureCategory.Door, captureSize, splineEntities, sketch, ref nextEntityId);
+            PlaceStructuralProps(windows, StructureCategory.Window, captureSize, splineEntities, sketch, ref nextEntityId);
 
             sketch.maxUsedEntityId = nextEntityId - 1;
             return sketch;
