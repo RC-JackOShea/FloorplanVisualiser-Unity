@@ -79,11 +79,32 @@ namespace FloorplanVectoriser.App
         [SerializeField] private Button resetButton;
         [SerializeField] private Button saveButton;
 
+        [Header("UI - Viewing Toggles")]
+        [SerializeField] private Button outerWallsButton;
+        [SerializeField] private Button innerWallsButton;
+        [SerializeField] private Button splinePointsButton;
+        [SerializeField] private Button doorsWindowsButton;
+
         AppState _currentState;
         GameObject _generatedMeshRoot;
         GameObject _debugRoot;
         SketchFile _lastSketch;
         string _lastSketchJson;
+
+        // Category containers for toggle visibility
+        GameObject _outerWallsContainer;
+        GameObject _innerWallsContainer;
+        GameObject _junctionsContainer;
+        GameObject _doorsWindowsContainer;
+
+        // Toggle state tracking
+        bool _outerWallsVisible = true;
+        bool _innerWallsVisible = true;
+        bool _splinePointsVisible = true;
+        bool _doorsWindowsVisible = true;
+
+        static readonly Color ToggleOnColor = new Color(0.2f, 0.8f, 0.2f);
+        static readonly Color ToggleOffColor = new Color(0.8f, 0.2f, 0.2f);
 
         void Start()
         {
@@ -96,6 +117,12 @@ namespace FloorplanVectoriser.App
             if (retakeButton != null) retakeButton.onClick.AddListener(OnRetakePressed);
             if (resetButton != null) resetButton.onClick.AddListener(OnResetPressed);
             if (saveButton != null) saveButton.onClick.AddListener(OnSavePressed);
+
+            // Viewing toggle buttons
+            if (outerWallsButton != null) outerWallsButton.onClick.AddListener(() => ToggleCategory(ref _outerWallsVisible, _outerWallsContainer, outerWallsButton));
+            if (innerWallsButton != null) innerWallsButton.onClick.AddListener(() => ToggleCategory(ref _innerWallsVisible, _innerWallsContainer, innerWallsButton));
+            if (splinePointsButton != null) splinePointsButton.onClick.AddListener(() => ToggleCategory(ref _splinePointsVisible, _junctionsContainer, splinePointsButton));
+            if (doorsWindowsButton != null) doorsWindowsButton.onClick.AddListener(() => ToggleCategory(ref _doorsWindowsVisible, _doorsWindowsContainer, doorsWindowsButton));
 
             TransitionTo(AppState.CameraPreview);
         }
@@ -134,6 +161,14 @@ namespace FloorplanVectoriser.App
                         Destroy(_debugRoot);
                         _debugRoot = null;
                     }
+                    _outerWallsContainer = null;
+                    _innerWallsContainer = null;
+                    _junctionsContainer = null;
+                    _doorsWindowsContainer = null;
+                    _outerWallsVisible = true;
+                    _innerWallsVisible = true;
+                    _splinePointsVisible = true;
+                    _doorsWindowsVisible = true;
                     break;
 
                 case AppState.ImageReview:
@@ -154,6 +189,10 @@ namespace FloorplanVectoriser.App
                 case AppState.Viewing:
                     // Orbit is enabled by CameraController after transition
                     SetActive(viewingUI, true);
+                    UpdateToggleButtonColor(outerWallsButton, _outerWallsVisible);
+                    UpdateToggleButtonColor(innerWallsButton, _innerWallsVisible);
+                    UpdateToggleButtonColor(splinePointsButton, _splinePointsVisible);
+                    UpdateToggleButtonColor(doorsWindowsButton, _doorsWindowsVisible);
                     break;
             }
         }
@@ -321,6 +360,15 @@ namespace FloorplanVectoriser.App
                 var debugRoot = new GameObject("DebugWallEndpoints");
                 _debugRoot = debugRoot;
 
+                // Category containers for toggle visibility
+                var junctionsContainer = new GameObject("Junctions");
+                junctionsContainer.transform.SetParent(debugRoot.transform);
+                _junctionsContainer = junctionsContainer;
+
+                var doorsWindowsContainer = new GameObject("DoorsWindows");
+                doorsWindowsContainer.transform.SetParent(debugRoot.transform);
+                _doorsWindowsContainer = doorsWindowsContainer;
+
                 // Build a quick lookup from junction ID to position (used by debug vis + mesh gen)
                 var junctionPos = new System.Collections.Generic.Dictionary<int, Vector3>();
                 foreach (var j in extraction.Junctions)
@@ -336,13 +384,13 @@ namespace FloorplanVectoriser.App
                     {
                         var sphere = GameObject.CreatePrimitive(PrimitiveType.Sphere);
                         sphere.name = $"J[{junction.Id}]";
-                        sphere.transform.SetParent(debugRoot.transform);
+                        sphere.transform.SetParent(junctionsContainer.transform);
                         sphere.transform.localPosition = junction.Position;
                         sphere.transform.localScale = Vector3.one * 0.25f;
                         sphere.GetComponent<Renderer>().sharedMaterial = blueMat;
                         Destroy(sphere.GetComponent<Collider>());
 
-                        CreateDebugLabel($"J{junction.Id}", junction.Position, debugRoot.transform, Color.blue);
+                        CreateDebugLabel($"J{junction.Id}", junction.Position, junctionsContainer.transform, Color.blue);
                     }
 
                     Debug.Log($"[Debug] {extraction.Junctions.Count} junction points (blue)");
@@ -372,7 +420,7 @@ namespace FloorplanVectoriser.App
                         Vector3 lineEnd = posB - dir * buffer;
 
                         var lineObj = new GameObject($"C[{conn.Id}] J{conn.JunctionA}-J{conn.JunctionB}{(isOuter ? " [OUTER]" : "")}");
-                        lineObj.transform.SetParent(debugRoot.transform);
+                        lineObj.transform.SetParent(junctionsContainer.transform);
 
                         var lr = lineObj.AddComponent<LineRenderer>();
                         lr.useWorldSpace = false;
@@ -386,7 +434,7 @@ namespace FloorplanVectoriser.App
                         // Label at midpoint
                         Vector3 mid = (posA + posB) * 0.5f;
                         Color labelColor = isOuter ? Color.red : Color.green;
-                        CreateDebugLabel($"C{conn.Id}", mid, debugRoot.transform, labelColor, 2f);
+                        CreateDebugLabel($"C{conn.Id}", mid, junctionsContainer.transform, labelColor, 2f);
                     }
 
                     Debug.Log($"[Debug] {extraction.Connections.Count} connections ({outerCount} outer/red, {extraction.Connections.Count - outerCount} interior/green)");
@@ -403,13 +451,13 @@ namespace FloorplanVectoriser.App
                         var ix = extraction.Intersections[i];
                         var sphere = GameObject.CreatePrimitive(PrimitiveType.Sphere);
                         sphere.name = $"IX[{i}] (Seg{ix.SegmentA} x Seg{ix.SegmentB})";
-                        sphere.transform.SetParent(debugRoot.transform);
+                        sphere.transform.SetParent(junctionsContainer.transform);
                         sphere.transform.localPosition = ix.Position;
                         sphere.transform.localScale = Vector3.one * 0.3f;
                         sphere.GetComponent<Renderer>().sharedMaterial = yellowMat;
                         Destroy(sphere.GetComponent<Collider>());
 
-                        CreateDebugLabel($"IX{i}", ix.Position, debugRoot.transform, Color.yellow);
+                        CreateDebugLabel($"IX{i}", ix.Position, junctionsContainer.transform, Color.yellow);
                     }
 
                     Debug.Log($"[Debug] {extraction.Intersections.Count} intersection points (yellow)");
@@ -425,13 +473,13 @@ namespace FloorplanVectoriser.App
                     {
                         var sphere = GameObject.CreatePrimitive(PrimitiveType.Sphere);
                         sphere.name = $"Door[{i}]";
-                        sphere.transform.SetParent(debugRoot.transform);
+                        sphere.transform.SetParent(doorsWindowsContainer.transform);
                         sphere.transform.localPosition = doorPositions[i];
                         sphere.transform.localScale = Vector3.one * 0.2f;
                         sphere.GetComponent<Renderer>().sharedMaterial = doorMat;
                         Destroy(sphere.GetComponent<Collider>());
 
-                        CreateDebugLabel($"D{i}", doorPositions[i], debugRoot.transform, Color.yellow);
+                        CreateDebugLabel($"D{i}", doorPositions[i], doorsWindowsContainer.transform, Color.yellow);
                     }
                 }
 
@@ -445,13 +493,13 @@ namespace FloorplanVectoriser.App
                     {
                         var sphere = GameObject.CreatePrimitive(PrimitiveType.Sphere);
                         sphere.name = $"Window[{i}]";
-                        sphere.transform.SetParent(debugRoot.transform);
+                        sphere.transform.SetParent(doorsWindowsContainer.transform);
                         sphere.transform.localPosition = windowPositions[i];
                         sphere.transform.localScale = Vector3.one * 0.2f;
                         sphere.GetComponent<Renderer>().sharedMaterial = winMat;
                         Destroy(sphere.GetComponent<Collider>());
 
-                        CreateDebugLabel($"W{i}", windowPositions[i], debugRoot.transform, Color.magenta);
+                        CreateDebugLabel($"W{i}", windowPositions[i], doorsWindowsContainer.transform, Color.magenta);
                     }
                 }
 
@@ -464,9 +512,17 @@ namespace FloorplanVectoriser.App
                           $"{extraction.Intersections.Count} intersections " +
                           $"[weldTolerance={weldTolerance:F3}m]");
 
-                // Generate outer wall mesh from boundary connections
-                var meshRoot = new GameObject("OuterWallMesh");
+                // Generate wall meshes
+                var meshRoot = new GameObject("WallMeshes");
                 _generatedMeshRoot = meshRoot;
+
+                var outerWallsContainer = new GameObject("OuterWalls");
+                outerWallsContainer.transform.SetParent(meshRoot.transform);
+                _outerWallsContainer = outerWallsContainer;
+
+                var innerWallsContainer = new GameObject("InnerWalls");
+                innerWallsContainer.transform.SetParent(meshRoot.transform);
+                _innerWallsContainer = innerWallsContainer;
 
                 foreach (var conn in extraction.Connections)
                 {
@@ -489,7 +545,7 @@ namespace FloorplanVectoriser.App
                         top[i] = bottom[i] + Vector3.up * extrudeHeight;
 
                     var wallObj = new GameObject($"OuterWall_C{conn.Id}");
-                    wallObj.transform.SetParent(meshRoot.transform);
+                    wallObj.transform.SetParent(outerWallsContainer.transform);
                     wallObj.AddComponent<MeshFilter>().mesh = BuildBoxMesh(bottom, top);
                     wallObj.AddComponent<MeshRenderer>().material = wallMaterial;
                 }
@@ -571,7 +627,7 @@ namespace FloorplanVectoriser.App
                             ? $"InnerWall_J{chain[0]}-J{chain[1]}"
                             : $"InnerWall_J{chain[0]}-...-J{chain[chain.Count - 1]}({chain.Count}pts)";
                         var wallObj = new GameObject(label);
-                        wallObj.transform.SetParent(meshRoot.transform);
+                        wallObj.transform.SetParent(innerWallsContainer.transform);
                         wallObj.AddComponent<MeshFilter>().mesh = BuildBoxMesh(bottom, top);
                         wallObj.AddComponent<MeshRenderer>().material = wallMaterial;
                         interiorCount++;
@@ -626,6 +682,23 @@ namespace FloorplanVectoriser.App
         static void SetActive(GameObject obj, bool active)
         {
             if (obj != null) obj.SetActive(active);
+        }
+
+        void ToggleCategory(ref bool visible, GameObject container, Button button)
+        {
+            visible = !visible;
+            SetActive(container, visible);
+            UpdateToggleButtonColor(button, visible);
+        }
+
+        static void UpdateToggleButtonColor(Button button, bool visible)
+        {
+            if (button == null) return;
+            var colors = button.colors;
+            colors.normalColor = visible ? ToggleOnColor : ToggleOffColor;
+            colors.selectedColor = colors.normalColor;
+            colors.highlightedColor = colors.normalColor;
+            button.colors = colors;
         }
 
         /// <summary>
