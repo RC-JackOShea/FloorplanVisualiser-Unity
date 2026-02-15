@@ -291,6 +291,11 @@ namespace FloorplanVectoriser.App
                 var debugRoot = new GameObject("DebugWallEndpoints");
                 _debugRoot = debugRoot;
 
+                // Build a quick lookup from junction ID to position (used by debug vis + mesh gen)
+                var junctionPos = new System.Collections.Generic.Dictionary<int, Vector3>();
+                foreach (var j in extraction.Junctions)
+                    junctionPos[j.Id] = j.Position;
+
                 // Junction points (blue spheres with J[n] labels — IDs match extraction data)
                 if (showSplinePoints)
                 {
@@ -321,11 +326,6 @@ namespace FloorplanVectoriser.App
                     outerMat.color = Color.red;
 
                     const float buffer = 0.15f; // pull line ends away from junction centres
-
-                    // Build a quick lookup from junction ID to position
-                    var junctionPos = new System.Collections.Generic.Dictionary<int, Vector3>();
-                    foreach (var j in extraction.Junctions)
-                        junctionPos[j.Id] = j.Position;
 
                     int outerCount = 0;
                     foreach (var conn in extraction.Connections)
@@ -391,32 +391,47 @@ namespace FloorplanVectoriser.App
                           $"{extraction.Connections.Count} connections, " +
                           $"{extraction.Intersections.Count} intersections " +
                           $"[weldTolerance={weldTolerance:F3}m]");
+
+                // Generate outer wall mesh from boundary connections
+                var meshRoot = new GameObject("OuterWallMesh");
+                _generatedMeshRoot = meshRoot;
+
+                foreach (var conn in extraction.Connections)
+                {
+                    if (!extraction.OuterBoundaryConnectionIds.Contains(conn.Id)) continue;
+                    if (!junctionPos.TryGetValue(conn.JunctionA, out var posA2)) continue;
+                    if (!junctionPos.TryGetValue(conn.JunctionB, out var posB2)) continue;
+
+                    float halfThick = Mathf.Max(conn.Thickness * 0.5f, 0.05f);
+                    Vector3 dir = (posB2 - posA2).normalized;
+                    Vector3 perp = new Vector3(-dir.z, 0f, dir.x);
+
+                    Vector3[] bottom = {
+                        posA2 - perp * halfThick,
+                        posA2 + perp * halfThick,
+                        posB2 + perp * halfThick,
+                        posB2 - perp * halfThick
+                    };
+                    Vector3[] top = new Vector3[4];
+                    for (int i = 0; i < 4; i++)
+                        top[i] = bottom[i] + Vector3.up * extrudeHeight;
+
+                    var wallObj = new GameObject($"OuterWall_C{conn.Id}");
+                    wallObj.transform.SetParent(meshRoot.transform);
+                    wallObj.AddComponent<MeshFilter>().mesh = BuildBoxMesh(bottom, top);
+                    wallObj.AddComponent<MeshRenderer>().material = wallMaterial;
+                }
+
+                meshRoot.transform.localScale = new Vector3(scaleX, 1f, scaleZ);
+                Debug.Log($"[Mesh] Generated outer wall mesh ({extraction.OuterBoundaryConnectionIds.Count} panels)");
             }
 
-            // Mesh generation disabled — focusing on spline/connection validation
-            // var meshBuilder = new FloorplanMeshBuilder(wallMaterial, doorMaterial, windowMaterial);
-            // StartCoroutine(meshBuilder.BuildFromSketchAsync(_lastSketch, meshesPerFrame, (root, bounds) =>
-            // {
-            //     _generatedMeshRoot = root;
-            //     float scaleX2 = worldScale / photoCaptureSize.x;
-            //     float scaleZ2 = worldScale / photoCaptureSize.y;
-            //     _generatedMeshRoot.transform.localScale = new Vector3(scaleX2, 0f, scaleZ2);
-            //     var worldBounds = new Bounds(
-            //         new Vector3(bounds.center.x * scaleX2, bounds.center.y, bounds.center.z * scaleZ2),
-            //         new Vector3(bounds.size.x * scaleX2, bounds.size.y, bounds.size.z * scaleZ2));
-            //     TransitionTo(AppState.CameraTransition);
-            //     cameraController.LerpToPerspective(worldBounds.center, worldBounds, () =>
-            //     {
-            //         StartCoroutine(AnimateMeshScaleUp(() => TransitionTo(AppState.Viewing)));
-            //     });
-            // }));
-
-            // Transition directly to viewing with debug points visible
+            // Transition to viewing
             TransitionTo(AppState.CameraTransition);
-            var debugBounds = _debugRoot != null
+            var viewBounds = _debugRoot != null
                 ? new Bounds(_debugRoot.transform.position, Vector3.one * worldScale)
                 : new Bounds(Vector3.zero, Vector3.one * worldScale);
-            cameraController.LerpToPerspective(debugBounds.center, debugBounds, () =>
+            cameraController.LerpToPerspective(viewBounds.center, viewBounds, () =>
             {
                 TransitionTo(AppState.Viewing);
             });
@@ -451,6 +466,45 @@ namespace FloorplanVectoriser.App
         static void SetActive(GameObject obj, bool active)
         {
             if (obj != null) obj.SetActive(active);
+        }
+
+        static Mesh BuildBoxMesh(Vector3[] bottom, Vector3[] top)
+        {
+            var vertices = new System.Collections.Generic.List<Vector3>(20);
+            var normals = new System.Collections.Generic.List<Vector3>(20);
+            var triangles = new System.Collections.Generic.List<int>(30);
+
+            AddQuad(vertices, normals, triangles, top[0], top[1], top[2], top[3], Vector3.up);
+            AddQuad(vertices, normals, triangles, bottom[0], bottom[1], top[1], top[0],
+                Vector3.Cross(bottom[1] - bottom[0], top[1] - bottom[0]).normalized);
+            AddQuad(vertices, normals, triangles, bottom[1], bottom[2], top[2], top[1],
+                Vector3.Cross(bottom[2] - bottom[1], top[2] - bottom[1]).normalized);
+            AddQuad(vertices, normals, triangles, bottom[2], bottom[3], top[3], top[2],
+                Vector3.Cross(bottom[3] - bottom[2], top[3] - bottom[2]).normalized);
+            AddQuad(vertices, normals, triangles, bottom[3], bottom[0], top[0], top[3],
+                Vector3.Cross(bottom[0] - bottom[3], top[0] - bottom[3]).normalized);
+
+            var mesh = new Mesh
+            {
+                vertices = vertices.ToArray(),
+                normals = normals.ToArray(),
+                triangles = triangles.ToArray()
+            };
+            mesh.RecalculateBounds();
+            return mesh;
+        }
+
+        static void AddQuad(
+            System.Collections.Generic.List<Vector3> verts,
+            System.Collections.Generic.List<Vector3> norms,
+            System.Collections.Generic.List<int> tris,
+            Vector3 a, Vector3 b, Vector3 c, Vector3 d, Vector3 normal)
+        {
+            int start = verts.Count;
+            verts.Add(a); verts.Add(b); verts.Add(c); verts.Add(d);
+            norms.Add(normal); norms.Add(normal); norms.Add(normal); norms.Add(normal);
+            tris.Add(start); tris.Add(start + 1); tris.Add(start + 2);
+            tris.Add(start); tris.Add(start + 2); tris.Add(start + 3);
         }
 
         static int CountByCategory(PolygonResult result, StructureCategory cat)
