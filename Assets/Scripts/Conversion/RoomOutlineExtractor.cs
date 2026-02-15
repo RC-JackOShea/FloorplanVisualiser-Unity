@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
+using System.Text;
 using UnityEngine;
 
 namespace FloorplanVectoriser.Conversion
@@ -243,8 +245,8 @@ namespace FloorplanVectoriser.Conversion
 
             // 11. Classify faces by signed area
             var results = new List<RoomOutline>();
-            float mostNegativeArea = 0f;
             int outerFaceIdx = -1;
+            float mostNegativeArea = 0f;
             const float MinFaceArea = 0.01f;
 
             for (int f = 0; f < faces.Count; f++)
@@ -289,14 +291,17 @@ namespace FloorplanVectoriser.Conversion
                 results.Add(outline);
             }
 
-            // Mark and fix the outer face winding
+            // Mark outer face
             if (outerFaceIdx >= 0)
             {
                 var outer = results[outerFaceIdx];
                 outer.IsExterior = true;
-                outer.Points.Reverse();
                 results[outerFaceIdx] = outer;
             }
+
+            // Debug: dump all pipeline data to a file for analysis
+            DumpDebugFile(segments, junctions, junctionCount, adjacency,
+                faces, results, outerFaceIdx, uncoveredIndices, edgesInFaces);
 
             return new ExtractionResult
             {
@@ -403,6 +408,94 @@ namespace FloorplanVectoriser.Conversion
         static int SourceOfDirectedEdge(long key)
         {
             return (int)(key >> 32);
+        }
+
+        // ── Debug output ──
+
+        static void DumpDebugFile(
+            List<WallChainBuilder.WallSegment> segments,
+            Vector3[] junctions, int junctionCount,
+            HashSet<int>[] adjacency,
+            List<List<int>> faces,
+            List<RoomOutline> results,
+            int outerFaceIdx,
+            List<int> uncoveredIndices,
+            HashSet<long> edgesInFaces)
+        {
+            try
+            {
+                string path = Path.Combine(Application.persistentDataPath, "debug_extraction.txt");
+                var sb = new StringBuilder();
+
+                sb.AppendLine("=== ROOM OUTLINE EXTRACTION DEBUG ===");
+                sb.AppendLine($"Timestamp: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+                sb.AppendLine();
+
+                // 1. Raw input segments
+                sb.AppendLine($"--- RAW WALL SEGMENTS ({segments.Count}) ---");
+                for (int i = 0; i < segments.Count; i++)
+                {
+                    var s = segments[i];
+                    sb.AppendLine($"  Seg[{i}]: ({s.Start.x:F3}, {s.Start.z:F3}) -> ({s.End.x:F3}, {s.End.z:F3})  thickness={s.Thickness:F3}");
+                }
+                sb.AppendLine();
+
+                // 2. Junction nodes after clustering + Manhattan snap
+                sb.AppendLine($"--- JUNCTIONS ({junctionCount}) ---");
+                for (int i = 0; i < junctionCount; i++)
+                {
+                    var j = junctions[i];
+                    var neighbors = adjacency[i];
+                    sb.AppendLine($"  J[{i}]: ({j.x:F3}, {j.z:F3})  degree={neighbors.Count}  neighbors=[{string.Join(", ", neighbors)}]");
+                }
+                sb.AppendLine();
+
+                // 3. All faces found by half-edge traversal
+                sb.AppendLine($"--- FACES ({faces.Count}) ---");
+                for (int f = 0; f < faces.Count; f++)
+                {
+                    var face = faces[f];
+                    float area = ComputeSignedArea(face, junctions);
+                    sb.Append($"  Face[{f}]: area={area:F3}  junctions=[{string.Join(", ", face)}]  points=[");
+                    for (int i = 0; i < face.Count; i++)
+                    {
+                        if (i > 0) sb.Append(", ");
+                        sb.Append($"({junctions[face[i]].x:F3}, {junctions[face[i]].z:F3})");
+                    }
+                    sb.AppendLine("]");
+                }
+                sb.AppendLine();
+
+                // 4. Room outlines (post-filtering)
+                sb.AppendLine($"--- ROOM OUTLINES ({results.Count}) ---");
+                for (int r = 0; r < results.Count; r++)
+                {
+                    var room = results[r];
+                    string tag = r == outerFaceIdx ? " [OUTER]" : "";
+                    sb.AppendLine($"  Room[{r}]{tag}: exterior={room.IsExterior}  thickness={room.Thickness:F3}  points={room.Points.Count}");
+                    for (int i = 0; i < room.Points.Count; i++)
+                    {
+                        var p = room.Points[i];
+                        sb.AppendLine($"    [{i}]: ({p.x:F3}, {p.z:F3})");
+                    }
+                }
+                sb.AppendLine();
+
+                // 5. Uncovered segments
+                sb.AppendLine($"--- UNCOVERED SEGMENTS ({uncoveredIndices.Count}) ---");
+                foreach (int idx in uncoveredIndices)
+                {
+                    var s = segments[idx];
+                    sb.AppendLine($"  Seg[{idx}]: ({s.Start.x:F3}, {s.Start.z:F3}) -> ({s.End.x:F3}, {s.End.z:F3})");
+                }
+
+                File.WriteAllText(path, sb.ToString());
+                Debug.Log($"[RoomOutlineExtractor] Debug data written to: {path}");
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[RoomOutlineExtractor] Failed to write debug file: {ex.Message}");
+            }
         }
 
         // ── Geometry ──

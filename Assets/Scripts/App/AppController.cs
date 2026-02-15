@@ -50,6 +50,13 @@ namespace FloorplanVectoriser.App
         [Tooltip("Photo capture size in metres — maps normalized [0,1] coordinates to world scale")]
         [SerializeField] private Vector2 photoCaptureSize = new Vector2(7f, 7f);
 
+        [Header("Debug Visualisation")]
+        [SerializeField] private bool showDebugPoints = true;
+        [SerializeField] private bool showWeldedPoints = true;
+        [SerializeField] private bool showSplinePoints = true;
+        [Tooltip("Max distance (m) to weld nearby wall segment endpoints together")]
+        [SerializeField] private float weldTolerance = 0.25f;
+
         [Header("UI - Capture")]
         [SerializeField] private GameObject captureUI;
         [SerializeField] private Button captureButton;
@@ -242,32 +249,175 @@ namespace FloorplanVectoriser.App
                       $"{CountByCategory(result, StructureCategory.Door)} doors, " +
                       $"{CountByCategory(result, StructureCategory.Window)} windows");
 
-            // Convert to sketch format and cache for save button
+            // Convert to sketch format — this is now the single source of truth
             _lastSketch = SketchConverter.Convert(result, photoCaptureSize);
             _lastSketchJson = SketchSerializer.SerializeJson(_lastSketch);
             Debug.Log($"Sketch JSON ({_lastSketch.entities.Count} entities):\n{_lastSketchJson}");
 
-            // Build 3D meshes asynchronously (spread across frames to avoid GPU timeout on mobile)
-            // Pass the image aspect ratio so meshes align with the preview plane
-            float aspectRatio = imageCapture.GetCurrentAspectRatio();
-            var meshBuilder = new FloorplanMeshBuilder(
-                wallMaterial, doorMaterial, windowMaterial, worldScale, extrudeHeight, aspectRatio);
-            
-            StartCoroutine(meshBuilder.BuildFromResultAsync(result, meshesPerFrame, (root, bounds) =>
+            // Auto-save sketch file
+            string sketchesDir = Path.Combine(Application.persistentDataPath, "Sketches");
+            Directory.CreateDirectory(sketchesDir);
+            string autoSavePath = Path.Combine(sketchesDir,
+                $"{_lastSketch.displayName}_{_lastSketch.guid}.sketch");
+            SketchSerializer.WriteSketchFile(autoSavePath, _lastSketch);
+            Debug.Log($"Sketch auto-saved to: {autoSavePath}");
+
+            // DEBUG: Visualize wall segment endpoints as spheres
+            // Red = unique endpoint, Green = welded (was within weldTolerance of another)
+            {
+                // Extract wall centerline segments (same as the conversion pipeline does)
+                var walls = new System.Collections.Generic.List<PolygonEntry>();
+                foreach (var poly in result.Polygons)
+                    if (poly.Category == StructureCategory.Wall) walls.Add(poly);
+
+                // Collect all endpoints
+                var endpoints = new System.Collections.Generic.List<Vector3>(walls.Count * 2);
+                var endpointLabels = new System.Collections.Generic.List<string>(walls.Count * 2);
+                for (int i = 0; i < walls.Count; i++)
+                {
+                    var seg = WallChainBuilder.ExtractCenterline(walls[i], photoCaptureSize);
+                    endpoints.Add(seg.Start);
+                    endpointLabels.Add($"Seg[{i}]_Start");
+                    endpoints.Add(seg.End);
+                    endpointLabels.Add($"Seg[{i}]_End");
+                }
+
+                // Union-find welding: merge endpoints within weldTolerance
+                int epCount = endpoints.Count;
+                int[] parent = new int[epCount];
+                for (int i = 0; i < epCount; i++) parent[i] = i;
+
+                float weldSq = weldTolerance * weldTolerance;
+                for (int i = 0; i < epCount; i++)
+                {
+                    for (int j = i + 1; j < epCount; j++)
+                    {
+                        float dx = endpoints[i].x - endpoints[j].x;
+                        float dz = endpoints[i].z - endpoints[j].z;
+                        if (dx * dx + dz * dz < weldSq)
+                        {
+                            // Union
+                            int ri = i, rj = j;
+                            while (parent[ri] != ri) ri = parent[ri];
+                            while (parent[rj] != rj) rj = parent[rj];
+                            if (ri != rj) parent[ri] = rj;
+                        }
+                    }
+                }
+
+                // Build clusters: root → list of member indices
+                var clusters = new System.Collections.Generic.Dictionary<int, System.Collections.Generic.List<int>>();
+                for (int i = 0; i < epCount; i++)
+                {
+                    int root = i;
+                    while (parent[root] != root) root = parent[root];
+                    if (!clusters.ContainsKey(root))
+                        clusters[root] = new System.Collections.Generic.List<int>();
+                    clusters[root].Add(i);
+                }
+
+                // Compute welded positions (centroid of each cluster)
+                var weldedPos = new Vector3[epCount];
+                var isWelded = new bool[epCount]; // true if part of a multi-member cluster
+                foreach (var kvp in clusters)
+                {
+                    Vector3 centroid = Vector3.zero;
+                    foreach (int idx in kvp.Value) centroid += endpoints[idx];
+                    centroid /= kvp.Value.Count;
+                    bool multi = kvp.Value.Count > 1;
+                    foreach (int idx in kvp.Value)
+                    {
+                        weldedPos[idx] = centroid;
+                        isWelded[idx] = multi;
+                    }
+                }
+
+                // Create spheres
+                float scaleX = worldScale / photoCaptureSize.x;
+                float scaleZ = worldScale / photoCaptureSize.y;
+
+                var debugRoot = new GameObject("DebugWallEndpoints");
+                _generatedMeshRoot = debugRoot;
+
+                var redMat = new Material(Shader.Find("Universal Render Pipeline/Unlit"));
+                redMat.color = Color.red;
+                var greenMat = new Material(Shader.Find("Universal Render Pipeline/Unlit"));
+                greenMat.color = Color.green;
+
+                int weldedCount = 0;
+                for (int i = 0; i < epCount; i++)
+                {
+                    bool welded = isWelded[i];
+
+                    // Skip based on toggle settings
+                    if (!showDebugPoints && !welded) continue;
+                    if (!showWeldedPoints && welded) continue;
+
+                    var sphere = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+                    sphere.name = endpointLabels[i];
+                    sphere.transform.SetParent(debugRoot.transform);
+                    sphere.transform.localPosition = weldedPos[i];
+                    sphere.transform.localScale = Vector3.one * 0.25f;
+                    sphere.GetComponent<Renderer>().sharedMaterial = welded ? greenMat : redMat;
+                    Destroy(sphere.GetComponent<Collider>());
+                    if (isWelded[i]) weldedCount++;
+                }
+
+                // Spline points: one per cluster at the welded/solo position (blue)
+                if (showSplinePoints)
+                {
+                    var blueMat = new Material(Shader.Find("Universal Render Pipeline/Unlit"));
+                    blueMat.color = Color.blue;
+
+                    int splineIdx = 0;
+                    foreach (var kvp in clusters)
+                    {
+                        var sphere = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+                        sphere.name = $"Spline[{splineIdx}]";
+                        sphere.transform.SetParent(debugRoot.transform);
+                        sphere.transform.localPosition = weldedPos[kvp.Value[0]];
+                        sphere.transform.localScale = Vector3.one * 0.25f;
+                        sphere.GetComponent<Renderer>().sharedMaterial = blueMat;
+                        Destroy(sphere.GetComponent<Collider>());
+                        splineIdx++;
+                    }
+
+                    Debug.Log($"[Debug] {splineIdx} spline points (blue)");
+                }
+
+                debugRoot.transform.localScale = new Vector3(scaleX, 1f, scaleZ);
+
+                Debug.Log($"[Debug] {epCount} endpoints, {clusters.Count} unique positions " +
+                          $"({weldedCount} welded, {epCount - weldedCount} solo) " +
+                          $"[weldTolerance={weldTolerance:F3}m]");
+
+                TransitionTo(AppState.Viewing);
+            }
+
+            /* COMMENTED OUT: Normal mesh building from sketch data
+            var meshBuilder = new FloorplanMeshBuilder(wallMaterial, doorMaterial, windowMaterial);
+
+            StartCoroutine(meshBuilder.BuildFromSketchAsync(_lastSketch, meshesPerFrame, (root, bounds) =>
             {
                 _generatedMeshRoot = root;
 
-                // Start mesh with Y scale at zero for expand animation
-                _generatedMeshRoot.transform.localScale = new Vector3(1f, 0f, 1f);
+                float scaleX = worldScale / photoCaptureSize.x;
+                float scaleZ = worldScale / photoCaptureSize.y;
 
-                // Transition camera to perspective orbit
+                _generatedMeshRoot.transform.localScale = new Vector3(scaleX, 0f, scaleZ);
+
+                var worldBounds = new Bounds(
+                    new Vector3(bounds.center.x * scaleX, bounds.center.y, bounds.center.z * scaleZ),
+                    new Vector3(bounds.size.x * scaleX, bounds.size.y, bounds.size.z * scaleZ)
+                );
+
                 TransitionTo(AppState.CameraTransition);
-                cameraController.LerpToPerspective(bounds.center, bounds, () =>
+                cameraController.LerpToPerspective(worldBounds.center, worldBounds, () =>
                 {
-                    // Animate mesh scaling up from ground after camera arrives
                     StartCoroutine(AnimateMeshScaleUp(() => TransitionTo(AppState.Viewing)));
                 });
             }));
+            */
         }
 
         // --- Helpers ---
@@ -280,16 +430,19 @@ namespace FloorplanVectoriser.App
                 yield break;
             }
 
+            float scaleX = worldScale / photoCaptureSize.x;
+            float scaleZ = worldScale / photoCaptureSize.y;
+
             float elapsed = 0f;
             while (elapsed < meshScaleUpDuration)
             {
                 float t = Mathf.SmoothStep(0f, 1f, elapsed / meshScaleUpDuration);
-                _generatedMeshRoot.transform.localScale = new Vector3(1f, t, 1f);
+                _generatedMeshRoot.transform.localScale = new Vector3(scaleX, t, scaleZ);
                 elapsed += Time.deltaTime;
                 yield return null;
             }
 
-            _generatedMeshRoot.transform.localScale = Vector3.one;
+            _generatedMeshRoot.transform.localScale = new Vector3(scaleX, 1f, scaleZ);
             onComplete?.Invoke();
         }
 
