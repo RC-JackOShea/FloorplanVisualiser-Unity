@@ -88,6 +88,8 @@ namespace FloorplanVectoriser.Conversion
             public List<JunctionPoint> Junctions;
             /// <summary>All connections (edges) between junctions, with stable IDs matching C[n] labels.</summary>
             public List<Connection> Connections;
+            /// <summary>Connection IDs that form the outer boundary (longest path around the outside).</summary>
+            public HashSet<int> OuterBoundaryConnectionIds;
         }
 
         /// <summary>
@@ -107,7 +109,8 @@ namespace FloorplanVectoriser.Conversion
                 Intersections = new List<IntersectionPoint>(),
                 SplitSegments = segments,
                 Junctions = new List<JunctionPoint>(),
-                Connections = new List<Connection>()
+                Connections = new List<Connection>(),
+                OuterBoundaryConnectionIds = new HashSet<int>()
             };
 
             if (segments.Count < 3)
@@ -218,9 +221,17 @@ namespace FloorplanVectoriser.Conversion
             for (int i = 0; i < junctionCount; i++)
                 prePruneNeighbors.Add(new HashSet<int>(adjacency[i]));
 
-            // 5. Prune dead ends (degree-1 vertices) — they can't form rooms
+            // 5. Compute prune log for debug, but do NOT apply pruning to the adjacency
+            //    graph. The full (unpruned) graph is used for face traversal so the outer
+            //    boundary includes dead-end stubs as back-and-forth excursions.
             var pruneLog = new List<string>();
-            PruneDeadEnds(adjacency, junctionCount, pruneLog);
+            {
+                // Clone adjacency to compute what pruning would remove (debug only)
+                var pruneClone = new HashSet<int>[junctionCount];
+                for (int i = 0; i < junctionCount; i++)
+                    pruneClone[i] = new HashSet<int>(adjacency[i]);
+                PruneDeadEnds(pruneClone, junctionCount, pruneLog);
+            }
 
             // 6. Sort neighbors at each vertex by angle in the X-Z plane
             var sortedNeighbors = new List<int>[junctionCount];
@@ -275,7 +286,7 @@ namespace FloorplanVectoriser.Conversion
 
                 var face = new List<int>();
                 long current = edgeKey;
-                int safety = junctionCount * 4;
+                int safety = junctionCount * 8;
 
                 while (!visited.Contains(current) && safety-- > 0)
                 {
@@ -312,10 +323,10 @@ namespace FloorplanVectoriser.Conversion
             }
 
             // 11. Classify faces by signed area
+            const float MinFaceArea = 0.01f;
             var results = new List<RoomOutline>();
             int outerFaceIdx = -1;
             float mostNegativeArea = 0f;
-            const float MinFaceArea = 0.01f;
 
             for (int f = 0; f < faces.Count; f++)
             {
@@ -371,7 +382,7 @@ namespace FloorplanVectoriser.Conversion
                           $"(face {outerFaceIdx}, area={mostNegativeArea:F3})");
             }
 
-            // 13. Build exposed junction and connection lists (pre-pruning, so all walls are visible)
+            // 13. Build exposed junction and connection lists (all edges, including dead-end stubs)
             var junctionList = new List<JunctionPoint>(junctionCount);
             for (int i = 0; i < junctionCount; i++)
             {
@@ -379,6 +390,7 @@ namespace FloorplanVectoriser.Conversion
             }
 
             var connectionList = new List<Connection>();
+            var edgeKeyToConnId = new Dictionary<long, int>();
             var visitedEdges = new HashSet<long>();
             int connId = 0;
             for (int v = 0; v < junctionCount; v++)
@@ -390,6 +402,7 @@ namespace FloorplanVectoriser.Conversion
                     visitedEdges.Add(ek);
 
                     float thickness = edgeThickness.TryGetValue(ek, out float t) ? t : 0.1f;
+                    edgeKeyToConnId[ek] = connId;
                     connectionList.Add(new Connection
                     {
                         Id = connId++,
@@ -397,6 +410,41 @@ namespace FloorplanVectoriser.Conversion
                         JunctionB = u,
                         Thickness = thickness
                     });
+                }
+            }
+
+            // 14. Identify which connections form the outer boundary
+            var outerConnIds = new HashSet<int>();
+            if (outerFaceIdx >= 0)
+            {
+                // Find the face that was classified as outer
+                List<int> outerFace = null;
+                // outerFaceIdx is the index in 'results' — we need the corresponding face
+                // Re-trace: results were added in face order (skipping tiny ones)
+                int convergingIdx = 0;
+                for (int f = 0; f < faces.Count; f++)
+                {
+                    float signedArea = ComputeSignedArea(faces[f], junctions);
+                    if (Mathf.Abs(signedArea) < MinFaceArea) continue;
+                    if (convergingIdx == outerFaceIdx)
+                    {
+                        outerFace = faces[f];
+                        break;
+                    }
+                    convergingIdx++;
+                }
+
+                if (outerFace != null)
+                {
+                    for (int i = 0; i < outerFace.Count; i++)
+                    {
+                        int j = (i + 1) % outerFace.Count;
+                        long ek = EdgeKey(outerFace[i], outerFace[j]);
+                        if (edgeKeyToConnId.TryGetValue(ek, out int cid))
+                            outerConnIds.Add(cid);
+                    }
+                    Debug.Log($"[RoomOutlineExtractor] Outer boundary uses {outerConnIds.Count} connections " +
+                              $"(face has {outerFace.Count} vertices)");
                 }
             }
 
@@ -413,7 +461,8 @@ namespace FloorplanVectoriser.Conversion
                 Intersections = intersections,
                 SplitSegments = segments,
                 Junctions = junctionList,
-                Connections = connectionList
+                Connections = connectionList,
+                OuterBoundaryConnectionIds = outerConnIds
             };
         }
 

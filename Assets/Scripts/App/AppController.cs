@@ -313,10 +313,12 @@ namespace FloorplanVectoriser.App
                     Debug.Log($"[Debug] {extraction.Junctions.Count} junction points (blue)");
                 }
 
-                // Connection lines (blue, buffered away from junction spheres)
+                // Connection lines (green = interior, red = outer boundary)
                 {
                     var connMat = new Material(Shader.Find("Universal Render Pipeline/Unlit"));
                     connMat.color = Color.green;
+                    var outerMat = new Material(Shader.Find("Universal Render Pipeline/Unlit"));
+                    outerMat.color = Color.red;
 
                     const float buffer = 0.15f; // pull line ends away from junction centres
 
@@ -325,17 +327,21 @@ namespace FloorplanVectoriser.App
                     foreach (var j in extraction.Junctions)
                         junctionPos[j.Id] = j.Position;
 
+                    int outerCount = 0;
                     foreach (var conn in extraction.Connections)
                     {
                         if (!junctionPos.TryGetValue(conn.JunctionA, out var posA)) continue;
                         if (!junctionPos.TryGetValue(conn.JunctionB, out var posB)) continue;
+
+                        bool isOuter = extraction.OuterBoundaryConnectionIds.Contains(conn.Id);
+                        if (isOuter) outerCount++;
 
                         // Shorten the line by 'buffer' at each end so it doesn't overlap the spheres
                         Vector3 dir = (posB - posA).normalized;
                         Vector3 lineStart = posA + dir * buffer;
                         Vector3 lineEnd = posB - dir * buffer;
 
-                        var lineObj = new GameObject($"C[{conn.Id}] J{conn.JunctionA}-J{conn.JunctionB}");
+                        var lineObj = new GameObject($"C[{conn.Id}] J{conn.JunctionA}-J{conn.JunctionB}{(isOuter ? " [OUTER]" : "")}");
                         lineObj.transform.SetParent(debugRoot.transform);
 
                         var lr = lineObj.AddComponent<LineRenderer>();
@@ -345,14 +351,15 @@ namespace FloorplanVectoriser.App
                         lr.SetPosition(1, lineEnd);
                         lr.startWidth = 0.06f;
                         lr.endWidth = 0.06f;
-                        lr.material = connMat;
+                        lr.material = isOuter ? outerMat : connMat;
 
                         // Label at midpoint
                         Vector3 mid = (posA + posB) * 0.5f;
-                        CreateDebugLabel($"C{conn.Id}", mid, debugRoot.transform, Color.green, 2f);
+                        Color labelColor = isOuter ? Color.red : Color.green;
+                        CreateDebugLabel($"C{conn.Id}", mid, debugRoot.transform, labelColor, 2f);
                     }
 
-                    Debug.Log($"[Debug] {extraction.Connections.Count} connections (blue lines)");
+                    Debug.Log($"[Debug] {extraction.Connections.Count} connections ({outerCount} outer/red, {extraction.Connections.Count - outerCount} interior/green)");
                 }
 
                 // Intersection points (yellow spheres with IX[n] labels)
